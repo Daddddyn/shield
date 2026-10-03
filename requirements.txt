@@ -1,0 +1,5 @@
+PyQt6>=6.8
+PyQt6-WebEngine>=6.8
+yara-x>=1.0
+pefile>=2023.2.7
+cryptography>=43.0
