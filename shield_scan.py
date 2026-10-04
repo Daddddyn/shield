@@ -621,19 +621,37 @@ class YaraEngine:
             raise RuntimeError("yara-x is not installed (pip install yara-x)")
         if progress:
             progress("Downloading rules")
+        LIMIT = 80 * 1024 * 1024
         req = urllib.request.Request(self.FORGE, headers={"User-Agent": f"Shield-Browser/{VERSION}"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = r.read(80 * 1024 * 1024)
+        with urllib.request.build_opener(_TrustedRedirects).open(req, timeout=60) as r:
+            data = r.read(LIMIT + 1)
+        if len(data) > LIMIT:
+            raise RuntimeError("The rules download was larger than expected, so it was ignored")
         z = zipfile.ZipFile(io.BytesIO(data))
-        member = next((n for n in z.namelist() if n.endswith(".yar")), None)
-        if not member:
+        info = next((i for i in z.infolist() if i.filename.endswith(".yar")), None)
+        if not info:
             raise RuntimeError("The download didn't contain a rules file")
-        text = z.read(member).decode("utf-8", "replace")
+        if info.file_size > 200 * 1024 * 1024:          # a zip bomb claims a small file and unpacks to a huge one
+            raise RuntimeError("The rules file was unreasonably large, so it was ignored")
+        with z.open(info) as f:
+            raw = f.read(info.file_size + 1)
+        if len(raw) > info.file_size:
+            raise RuntimeError("The rules file didn't match its declared size, so it was ignored")
+        text = raw.decode("utf-8", "replace")
         if progress:
             progress("Checking rules")
         c = yara_x.Compiler()
         c.add_source(text)
         c.build()  # raises if the rules don't compile; we only ever replace a working file with a working file
+        # A tampered or broken release that is nearly empty would silently switch most detection off.
+        count = len(re.findall(r"(?m)^\s*(?:(?:private|global)\s+)*rule\s+\w+", text))
+        old = self.dir / "yara-forge-core.yar"
+        if old.exists():
+            prev = len(re.findall(r"(?m)^\s*(?:(?:private|global)\s+)*rule\s+\w+", old.read_text("utf-8", "ignore")))
+            if prev >= 100 and count < prev // 2:
+                raise RuntimeError(f"The new rules ({count}) are far fewer than the current ones ({prev}), so they were not installed")
+        if count < 50:
+            raise RuntimeError("The rules file contained almost no rules, so it was ignored")
         tmp = self.dir / "yara-forge-core.yar.part"
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, self.dir / "yara-forge-core.yar")
@@ -901,6 +919,19 @@ class VTError(Exception):
     def __init__(self, message, kind="error", retry_after=0):
         super().__init__(message)
         self.kind, self.retry_after = kind, retry_after
+
+
+class _TrustedRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only over HTTPS and only to GitHub's own download hosts (a release download is always
+    redirected to one of them). Anything else is refused, so a hijacked link cannot send the rules update elsewhere."""
+    HOSTS = ("github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+             "github-releases.githubusercontent.com")
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        u = urllib.parse.urlparse(newurl)
+        if u.scheme != "https" or (u.hostname or "").lower() not in self.HOSTS:
+            raise urllib.error.URLError("refused a redirect to an untrusted address")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class _SameHostOnly(urllib.request.HTTPRedirectHandler):

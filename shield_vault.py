@@ -5,8 +5,12 @@ Design
 ------
   * One file on this computer (vault.shv). Nothing is synced or uploaded.
   * A random 256-bit data key encrypts the entries (AES-256-GCM). The data key is itself encrypted with a key
-    derived from your master password using scrypt (a deliberately slow, memory-hungry function, so guessing is
-    expensive). Changing the master password re-wraps the data key and never touches the entries.
+    derived from your master password using Argon2id (a deliberately slow, memory-hard function, so guessing is
+    expensive: 128 MiB and three passes per attempt). Vaults from older versions used scrypt; they still open, and
+    are upgraded the first time they are unlocked.
+  * Changing the master password (and every upgrade) creates a brand-new data key and re-encrypts the entries, then
+    deletes the backup copy. An old copy of the file that leaks together with the old password therefore cannot open
+    anything saved afterwards. Deleting an entry also deletes the backup that still held it.
   * The file header is authenticated, so changing the KDF settings or swapping parts of a file is detected.
   * The master password is never stored. Forget it and the vault cannot be opened: there is no recovery.
   * Everything, including the list of sites you told it never to save, lives inside the encrypted part, so the
@@ -36,15 +40,24 @@ from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
-FORMAT = 1
-KDF = {"n": 2 ** 16, "r": 8, "p": 2}          # about 0.3 s and 64 MB per attempt on a normal PC
-MIN_KDF_N = 2 ** 15                              # weaker files are upgraded on the next unlock
-MIN_MASTER = 10
+FORMAT = 2
+# Current settings: Argon2id, 128 MiB, 3 passes, 4 lanes (about half a second on a normal PC).
+KDF = {"alg": "argon2id", "m": 128 * 1024, "t": 3, "p": 4}
+# Bounds for what an opened file may ask for. Too low means a weak file (it is upgraded on unlock); too high means
+# a hostile file trying to exhaust memory or time.
+MIN_M, MAX_M = 64 * 1024, 1024 * 1024          # KiB
+MIN_T, MAX_T = 2, 12
+MIN_P, MAX_P = 1, 16
+# Format 1 (Shield 2.x): scrypt. Read-only; never written any more.
+LEGACY_SCRYPT = {"n": 2 ** 16, "r": 8, "p": 2}
+LEGACY_MIN_N = 2 ** 15
+MIN_MASTER = 12
 MAX_FIELD = 1024
 MAX_ENTRIES = 20000
-_WRAP_AAD = b"shield-vault/wrap/v1"
-_DATA_AAD = b"shield-vault/data/v1"
+_WRAP_AAD = {1: b"shield-vault/wrap/v1", 2: b"shield-vault/wrap/v2"}
+_DATA_AAD = {1: b"shield-vault/data/v1", 2: b"shield-vault/data/v2"}
 
 
 class VaultError(Exception):
@@ -63,8 +76,12 @@ def _normalize_master(pw):
     return unicodedata.normalize("NFKC", pw).encode("utf-8")
 
 
-def _derive(master, salt, n, r, p):
+def _derive_scrypt(master, salt, n, r, p):
     return hashlib.scrypt(_normalize_master(master), salt=salt, n=n, r=r, p=p, maxmem=256 * 1024 * 1024, dklen=32)
+
+
+def _derive_argon(master, salt, m, t, p):
+    return Argon2id(salt=salt, length=32, iterations=t, lanes=p, memory_cost=m).derive(_normalize_master(master))
 
 
 def norm_origin(url):
@@ -217,16 +234,63 @@ class Vault:
         if len(master or "") < MIN_MASTER:
             raise VaultError(f"The master password needs at least {MIN_MASTER} characters")
 
+    # -- key wrapping --------------------------------------------------------
+    @staticmethod
+    def _kdf_aad(kdf, salt, version=FORMAT):
+        """The key-derivation settings, bound into the wrapped key so they cannot be swapped without detection."""
+        if version == 1:
+            body = {"n": kdf["n"], "r": kdf["r"], "p": kdf["p"], "s": _b64(salt)}
+        else:
+            body = {"alg": kdf["alg"], "m": kdf["m"], "t": kdf["t"], "p": kdf["p"], "s": _b64(salt)}
+        return json.dumps(body, sort_keys=True).encode()
+
     def _new_head(self, master):
+        """Wrap self._key under a fresh salt with the current (Argon2id) settings."""
         salt = secrets.token_bytes(16)
-        kek = _derive(master, salt, KDF["n"], KDF["r"], KDF["p"])
+        kek = _derive_argon(master, salt, KDF["m"], KDF["t"], KDF["p"])
         nonce = secrets.token_bytes(12)
-        wrapped = AESGCM(kek).encrypt(nonce, self._key, _WRAP_AAD + self._kdf_aad(KDF, salt))
+        wrapped = AESGCM(kek).encrypt(nonce, self._key, _WRAP_AAD[FORMAT] + self._kdf_aad(KDF, salt))
         return {"v": FORMAT, "kdf": {**KDF, "salt": _b64(salt)}, "wrap": {"nonce": _b64(nonce), "ct": _b64(wrapped)}}
 
     @staticmethod
-    def _kdf_aad(kdf, salt):
-        return json.dumps({"n": kdf["n"], "r": kdf["r"], "p": kdf["p"], "s": _b64(salt)}, sort_keys=True).encode()
+    def _parse_kdf(head):
+        """(version, kdf settings, salt, is_current). Raises VaultError for a file asking for unsafe settings."""
+        v = head.get("v")
+        if v not in (1, 2):
+            raise VaultError("This vault was made by a newer version of Shield")
+        k = head["kdf"]
+        salt = _unb64(k["salt"])
+        if len(salt) < 16:
+            raise VaultError("The vault file has unsafe settings and was not opened")
+        if v == 1:
+            n, r, p = int(k["n"]), int(k["r"]), int(k["p"])
+            if not (LEGACY_MIN_N <= n <= 2 ** 20 and n & (n - 1) == 0 and 1 <= r <= 16 and 1 <= p <= 8):
+                raise VaultError("The vault file has unsafe settings and was not opened")
+            return 1, {"n": n, "r": r, "p": p}, salt, False
+        if k.get("alg") != "argon2id":
+            raise VaultError("The vault file has unsafe settings and was not opened")
+        m, t, p = int(k["m"]), int(k["t"]), int(k["p"])
+        if not (MIN_M <= m <= MAX_M and MIN_T <= t <= MAX_T and MIN_P <= p <= MAX_P):
+            raise VaultError("The vault file has unsafe settings and was not opened")
+        current = m >= KDF["m"] and t >= KDF["t"] and p >= KDF["p"]
+        return 2, {"alg": "argon2id", "m": m, "t": t, "p": p}, salt, current
+
+    def _unwrap(self, head, master):
+        """The data key if master is right, None if it is wrong. Raises VaultError for unreadable or unsafe files."""
+        try:
+            ver, k, salt, _cur = self._parse_kdf(head)
+            if ver == 1:
+                kek = _derive_scrypt(master, salt, k["n"], k["r"], k["p"])
+            else:
+                kek = _derive_argon(master, salt, k["m"], k["t"], k["p"])
+            return AESGCM(kek).decrypt(_unb64(head["wrap"]["nonce"]), _unb64(head["wrap"]["ct"]),
+                                       _WRAP_AAD[ver] + self._kdf_aad(k, salt, ver))
+        except InvalidTag:
+            return None
+        except VaultError:
+            raise
+        except (ValueError, KeyError, TypeError):
+            raise VaultError("The vault file is damaged. A backup may exist next to it (vault.shv.bak).") from None
 
     def wait_seconds(self):
         return max(0, int(self._block_until - time.time() + 0.999))
@@ -240,37 +304,39 @@ class Vault:
                 return False
             try:
                 head = json.loads(self.path.read_text("utf-8"))
-                if head.get("v") != FORMAT:
-                    raise VaultError("This vault was made by a newer version of Shield")
-                k = head["kdf"]
-                salt = _unb64(k["salt"])
-                if not (MIN_KDF_N <= int(k["n"]) <= 2 ** 20 and 1 <= int(k["r"]) <= 16 and 1 <= int(k["p"]) <= 8):
-                    raise VaultError("The vault file has unsafe settings and was not opened")
-            except (OSError, ValueError, KeyError, TypeError):
+                if not isinstance(head, dict):
+                    raise ValueError
+            except (OSError, ValueError):
                 raise VaultError("The vault file is damaged. A backup may exist next to it (vault.shv.bak).") from None
-            kek = _derive(master, salt, int(k["n"]), int(k["r"]), int(k["p"]))
-            try:
-                key = AESGCM(kek).decrypt(_unb64(head["wrap"]["nonce"]), _unb64(head["wrap"]["ct"]),
-                                          _WRAP_AAD + self._kdf_aad(k, salt))
-                blob = AESGCM(key).decrypt(_unb64(head["data"]["nonce"]), _unb64(head["data"]["ct"]),
-                                           _DATA_AAD + self._head_aad(head))
-                data = json.loads(blob.decode("utf-8"))
-            except InvalidTag:
-                self._fails += 1
-                self._block_until = time.time() + (min(30, 2 ** (self._fails - 3)) if self._fails > 3 else 0)
+            key = self._unwrap(head, master)
+            if key is None:
+                self._note_failure()
                 return False
-            except (ValueError, KeyError, TypeError):
+            try:
+                ver = head["v"]
+                blob = AESGCM(key).decrypt(_unb64(head["data"]["nonce"]), _unb64(head["data"]["ct"]),
+                                           _DATA_AAD[ver] + self._head_aad(head))
+                data = json.loads(blob.decode("utf-8"))
+            except (InvalidTag, ValueError, KeyError, TypeError):
                 raise VaultError("The vault file is damaged. A backup may exist next to it (vault.shv.bak).") from None
             self._fails, self._block_until = 0, 0.0
-            self._key, self._head = key, head
+            self._key, self._head = key, {k: v for k, v in head.items() if k != "data"}
             self.entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
             self.never = set(data.get("never", []))
             self.rev += 1
             self.touch()
-            if int(k["n"]) < KDF["n"] or int(k["p"]) < KDF["p"]:       # quietly strengthen an older vault
-                self._head = self._new_head(master)
-                self._save()
+            _ver, _k, _salt, current = self._parse_kdf(head)
+            if ver != FORMAT or not current:
+                # An older or weaker vault: move it to the current format with a brand-new data key.
+                try:
+                    self._rekey(master)
+                except (OSError, VaultError):
+                    pass            # it still opens fine; the upgrade is tried again next time
             return True
+
+    def _note_failure(self):
+        self._fails += 1
+        self._block_until = time.time() + (min(30, 2 ** (self._fails - 3)) if self._fails > 3 else 0)
 
     @staticmethod
     def _head_aad(head):
@@ -282,33 +348,42 @@ class Vault:
             self._need()
             try:
                 head = json.loads(self.path.read_text("utf-8"))
-                k = head["kdf"]
-                salt = _unb64(k["salt"])
-                kek = _derive(master, salt, int(k["n"]), int(k["r"]), int(k["p"]))
-                AESGCM(kek).decrypt(_unb64(head["wrap"]["nonce"]), _unb64(head["wrap"]["ct"]), _WRAP_AAD + self._kdf_aad(k, salt))
-                return True
-            except InvalidTag:
-                return False
-            except (OSError, ValueError, KeyError, TypeError):
+                if not isinstance(head, dict):
+                    raise ValueError
+            except (OSError, ValueError):
                 raise VaultError("The vault file couldn't be read") from None
+            return self._unwrap(head, master) is not None
+
+    def _rekey(self, master):
+        """New random data key, new salt, current KDF settings; entries re-encrypted; the old backup is deleted.
+        If anything fails, the in-memory state goes back to what it was and the file is left as it was."""
+        old_key, old_head = self._key, self._head
+        try:
+            self._key = secrets.token_bytes(32)
+            self._head = self._new_head(master)
+            self._save(drop_backup=True)
+        except Exception:
+            self._key, self._head = old_key, old_head
+            raise
 
     def change_master(self, old, new):
         with self._lock:
             self._need()
             self._check_master(new)
             if not self.verify_master(old):
+                self._note_failure()
                 return False
-            self._head = self._new_head(new)
-            self._save()
+            self._rekey(new)
             self.rev += 1
             return True
 
     # -- saving ----------------------------------------------------------------
-    def _save(self):
+    def _save(self, drop_backup=False):
         payload = json.dumps({"entries": self.entries, "never": sorted(self.never)}, separators=(",", ":")).encode("utf-8")
         nonce = secrets.token_bytes(12)
         head = dict(self._head)
-        head["data"] = {"nonce": _b64(nonce), "ct": _b64(AESGCM(self._key).encrypt(nonce, payload, _DATA_AAD + self._head_aad(head)))}
+        head["data"] = {"nonce": _b64(nonce),
+                        "ct": _b64(AESGCM(self._key).encrypt(nonce, payload, _DATA_AAD[head["v"]] + self._head_aad(head)))}
         self._head = {k: v for k, v in head.items() if k != "data"}
         text = json.dumps(head, separators=(",", ":"))
         tmp = self.path.with_suffix(".part")
@@ -316,9 +391,15 @@ class Vault:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+        if os.name != "nt":
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        bak = self.path.with_suffix(".shv.bak")
         if self.path.exists():
             try:
-                os.replace(self.path, self.path.with_suffix(".shv.bak"))
+                os.replace(self.path, bak)
             except OSError:
                 pass
         os.replace(tmp, self.path)
@@ -327,6 +408,22 @@ class Vault:
                 os.chmod(self.path, 0o600)
             except OSError:
                 pass
+        if drop_backup:
+            # Only after the new file is proven readable with the new key; until then the backup is the safety net.
+            if self._readback_ok(len(self.entries)):
+                try:
+                    bak.unlink()
+                except OSError:
+                    pass
+
+    def _readback_ok(self, count):
+        try:
+            head = json.loads(self.path.read_text("utf-8"))
+            blob = AESGCM(self._key).decrypt(_unb64(head["data"]["nonce"]), _unb64(head["data"]["ct"]),
+                                             _DATA_AAD[head["v"]] + self._head_aad(head))
+            return len(json.loads(blob.decode("utf-8")).get("entries", [])) == count
+        except Exception:
+            return False
 
     def _need(self):
         if not self.unlocked:
@@ -397,7 +494,7 @@ class Vault:
             n = len(self.entries)
             self.entries = [e for e in self.entries if e["id"] != eid]
             if len(self.entries) != n:
-                self._save()
+                self._save(drop_backup=True)      # the backup would still hold the deleted password
                 self.rev += 1
 
     def mark_used(self, eid):

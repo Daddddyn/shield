@@ -11,7 +11,8 @@ Turns built installers into an update that existing copies of Shield will accept
       2. build each system's package:  packaging\\build.ps1 (Windows), packaging/build.sh on a Mac and on Linux
          (or run the "Build installers" GitHub workflow and download its three artifacts)
       3. put every package for this version in the release/ folder (subfolders are fine)
-      4. python packaging/release.py --notes "What changed, in a sentence."
+      4. python packaging/release.py --notes "What changed, in a sentence." --min-chromium 150
+         (--days 45 is the default expiry; add --critical for an urgent security release)
       5. upload what it prints (release/upload/) to your download address
 
 It picks up whichever packages exist for this VERSION:
@@ -34,6 +35,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -132,6 +134,15 @@ def cmd_publish(a):
     win = platforms["windows-x64"]
     manifest = {"version": version, "url": win["url"], "sha256": win["sha256"], "notes": (a.notes or "")[:400],
                 "platforms": platforms}
+    # Signed along with everything else. "expires" stops anyone replaying an old, validly signed manifest to keep people
+    # from learning about a newer release; "min_chromium" makes copies with an older web engine show a warning;
+    # "critical" asks for the update at every start.
+    if a.days > 0:
+        manifest["expires"] = int(time.time()) + a.days * 86400
+    if a.min_chromium:
+        manifest["min_chromium"] = a.min_chromium
+    if a.critical:
+        manifest["critical"] = True
     mpath = out / "manifest.json"
     mpath.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     sig = shield_update.sign_file(mpath, KEY)
@@ -147,6 +158,11 @@ def cmd_publish(a):
         else:
             print(f"  {key:12} -- no package, so people on this system will not be offered {version}")
     print(f"  manifest     {mpath.name} + {sig.name}")
+    if "expires" in manifest:
+        print(f"\nThis manifest expires in {a.days} days. Run release.py again (same version is fine) before then, or Shield\n"
+              "will ignore it and say the update information is stale.")
+    else:
+        print("\nWarning: no expiry set (--days 0). Set one so an old signed manifest can't be replayed.")
     print(f"\nShield looks for the manifest at:\n  {shield_update.UPDATE_URL}")
     print("\nUpload the installers FIRST and the manifest and signature last, so nobody is told about an update that isn't there yet.")
     print("With the GitHub CLI, for a release whose tag is the last part of the manifest address (here: shield):")
@@ -159,6 +175,10 @@ def main():
     ap.add_argument("action", nargs="?", default="publish", choices=["publish", "keygen"])
     ap.add_argument("--notes", help="one sentence shown to people in Settings > Updates")
     ap.add_argument("--base-url", help="folder the installers will be hosted in (default: same folder as UPDATE_URL)")
+    ap.add_argument("--days", type=int, default=45, help="how long this manifest stays valid (default 45; 0 = never expires, not advised)")
+    ap.add_argument("--min-chromium", type=int, default=0,
+                    help="oldest web-engine security-patch major still considered safe (see the steps: use the number the build prints, minus 1)")
+    ap.add_argument("--critical", action="store_true", help="a serious security release: Shield asks for it at every start")
     a = ap.parse_args()
     cmd_keygen() if a.action == "keygen" else cmd_publish(a)
 

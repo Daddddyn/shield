@@ -16,6 +16,7 @@ import threading
 import time
 from collections import Counter, deque
 from pathlib import Path
+from urllib.parse import urlparse
 
 from PyQt6.QtWebEngineCore import QWebEngineUrlRequestInfo, QWebEngineUrlRequestInterceptor
 
@@ -27,7 +28,7 @@ from shield_scan import (  # noqa: F401  (re-exported for the rest of the app)
     BENIGN_LOOKING, BIDI_CHARS, DOUBLE_EXT, EXEC_EXT, EXEC_MIMES, RISKY_EXT,
 )
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 HOME = Path(os.environ.get("SHIELD_HOME") or Path.home() / ".shieldbrowser")
 HOME.mkdir(parents=True, exist_ok=True)
 DOWNLOADS = Path(os.environ.get("SHIELD_DOWNLOADS") or Path.home() / "Downloads")
@@ -80,6 +81,8 @@ DEFAULTS = {
     "vault_autofill": True,
     # updates
     "check_updates": True,
+    # hardened mode: JavaScript runs without the JIT compiler (needs a restart). Slower pages, far fewer exploitable bugs.
+    "hardened_mode": False,
 }
 CHOICES = {
     "theme": {"dark", "light", "system"},
@@ -310,6 +313,7 @@ class Guard:
         self.allowed = set()   # (kind, site) the user chose to continue to this session
         self.http_ok = set()   # hosts allowed over plain HTTP this session
         self.upgrades = {}     # host -> time we last upgraded it to HTTPS
+        self.main_blocks = {}  # blocked top-level address -> (kind, detail, time): set on the network thread, read by the page
 
     def rules_for(self, host):
         parts = (host or "").lower().split(".")
@@ -331,6 +335,35 @@ class Guard:
         eng = p.engine
         if eng is not None and eng.harmful_hit(url.lower(), host):
             return ("scam", "Scam and malware sites")
+        return None
+
+    def note_main_block(self, url, verdict):
+        """Remember that a top-level request (often a redirect hop) was stopped, so the page can show the warning."""
+        now = time.time()
+        if len(self.main_blocks) > 64:
+            for k in [k for k, v in list(self.main_blocks.items()) if now - v[2] > 30]:
+                self.main_blocks.pop(k, None)
+        self.main_blocks[url] = (verdict[0], verdict[1], now)
+
+    def take_main_block(self, urls, hosts=()):
+        """The (kind, detail, blocked address) for a navigation that just failed because the interceptor stopped it.
+        urls: addresses the page believes it was loading. hosts: their host names (the stopped address is often the
+        last hop of a redirect chain, which the page may not know by its exact text)."""
+        now = time.time()
+        for u in urls:
+            hit = self.main_blocks.get(u)
+            if hit and now - hit[2] < 30:
+                self.main_blocks.pop(u, None)
+                return hit[0], hit[1], u
+        recent = [(u, h) for u, h in list(self.main_blocks.items()) if now - h[2] < 10]
+        wanted = {h.lower() for h in hosts if h}
+        pick = [(u, h) for u, h in recent if (urlparse(u).hostname or "").lower() in wanted]
+        if not pick and len(recent) == 1:       # only one candidate: no way to confuse it with another tab
+            pick = recent
+        if pick:
+            u, h = pick[0]
+            self.main_blocks.pop(u, None)
+            return h[0], h[1], u
         return None
 
     def verdict(self, host, url=""):
@@ -381,7 +414,7 @@ class Shield(QWebEngineUrlRequestInterceptor):
         try:
             self._go(info)
         except Exception:
-            pass
+            self.ev.add("error", "request check failed", log=False)
 
     def _go(self, info):
         s = self.s
@@ -413,6 +446,24 @@ class Shield(QWebEngineUrlRequestInterceptor):
             info.block(True)
             self.ev.add("local_net", f"{first} tried to reach {host}", site)
             return
+
+        # 2b. Every top-level request, including each hop of a redirect chain, gets the same warning check as a typed
+        #     address. acceptNavigationRequest only sees the first address, so without this a harmless-looking link
+        #     could redirect into a phishing page unchecked. The page shows the warning once the load fails.
+        if main and scheme in ("http", "https"):
+            try:
+                enc_main = _encoded(url)
+                v = self.g.verdict(host, enc_main)
+            except Exception:
+                v = None
+                self.ev.add("error", "navigation check failed", log=False)
+            if v:
+                self.g.note_main_block(url.toString(), v)
+                info.block(True)
+                self.ev.add("navigation", f"stopped a redirect into {v[0]} site {host}")
+                if v[0] in ("phishing", "malware", "scam"):
+                    self.ev.add("harmful", host, site_of(host), log=False)
+                return
 
         # 3. Ads, trackers and known-bad hosts (never on a site the user turned blocking off for).
         if not main and first and ("noblock" not in self.g.rules_for(first)):
@@ -504,12 +555,29 @@ def assess_download(name, url, mime):
     return out
 
 
+def _one_line(text):
+    return "".join(c for c in str(text or "") if c.isprintable() and c not in "\r\n")[:2000]
+
+
+def mark_of_the_web(path, url=""):
+    """Tag a file as downloaded from the internet (Windows alternate data stream). Windows itself, SmartScreen and
+    Office then treat it with suspicion. Returns True when the tag is in place (or does not apply on this system)."""
+    if os.name != "nt":
+        return True
+    try:
+        with open(str(path) + ":Zone.Identifier", "w", encoding="ascii", errors="replace", newline="") as f:
+            u = _one_line(url)
+            f.write(f"[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl={u}\r\nHostUrl={u}\r\n")
+        return True
+    except OSError:
+        return False
+
+
 def lock_down(path, url=""):
     """Make a quarantined file non-executable and tag it as downloaded from the internet."""
     try:
         if os.name == "nt":
-            with open(str(path) + ":Zone.Identifier", "w") as f:
-                f.write(f"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={url}\r\n")
+            mark_of_the_web(path, url)
         else:
             os.chmod(path, 0o400)
     except OSError:

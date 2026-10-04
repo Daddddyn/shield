@@ -17,18 +17,64 @@ import time
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
-# Chromium switches must be set before Qt starts.
+# --------------------------------------------------------------------------
+# Chromium switches. These must be set before Qt starts, and they are the browser's own, not the environment's:
+# anything that could weaken the sandbox, site isolation or certificate checks is refused even if some other
+# program (or malware that planted an environment variable) asks for it.
+# --------------------------------------------------------------------------
+STARTUP_WARNINGS = []     # shown in the Security center
+
+
+def _early_setting(name, default=False):
+    """Read one value from settings.json before Qt (and the rest of Shield) is loaded."""
+    try:
+        home = Path(os.environ.get("SHIELD_HOME") or Path.home() / ".shieldbrowser")
+        return json.loads((home / "settings.json").read_text("utf-8")).get(name, default)
+    except Exception:
+        return default
+
+
+HARDENED = _early_setting("hardened_mode") is True
+# Chromium honours only the LAST copy of a repeated switch, so each of these is one combined switch.
+_ENABLE = ["StrictOriginIsolation"]                       # every origin in its own process, not just every site
+_DISABLE = ["BrowsingTopics"]                             # no ad-interest profiling API
 _FLAGS = [
     "--site-per-process",                                   # every site in its own process
-    "--enable-features=StrictOriginIsolation",              # ...and every origin, not just site
+    "--enable-features=" + ",".join(_ENABLE),
+    "--disable-features=" + ",".join(_DISABLE),
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",  # no WebRTC IP leaks
     "--disable-background-networking", "--disable-sync", "--no-pings",
     "--disable-breakpad", "--disable-domain-reliability", "--no-default-browser-check",
     "--autoplay-policy=document-user-activation-required",  # no video or audio starts by itself
+    "--enable-strict-powerful-feature-restrictions",        # camera, location and similar only on secure pages
 ]
-os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(_FLAGS + [os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")]).strip()
+if HARDENED:
+    _FLAGS.append("--js-flags=--jitless")                  # no JIT: most browser exploits need it (this also turns off WebAssembly)
 
-from PyQt6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QObject, QSize, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal
+# Switches that are harmless and sometimes needed to work around graphics or display problems. Nothing else is
+# accepted from the environment.
+_SAFE_ENV_FLAG = re.compile(r"^--(disable-gpu|disable-gpu-compositing|disable-software-rasterizer|use-angle=[a-z0-9]+|"
+                            r"force-device-scale-factor=[0-9.]+|lang=[A-Za-z-]+)$")
+
+
+def _sanitize_environment():
+    for var in ("QTWEBENGINE_REMOTE_DEBUGGING", "QTWEBENGINE_DISABLE_SANDBOX"):
+        if os.environ.pop(var, None) is not None:
+            STARTUP_WARNINGS.append(f"Ignored the {var} setting from the environment: it would weaken the browser.")
+    inherited = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+    kept = [f for f in inherited if _SAFE_ENV_FLAG.match(f)]
+    dropped = [f for f in inherited if f not in kept]
+    if dropped:
+        STARTUP_WARNINGS.append(f"Ignored {len(dropped)} browser switch(es) from the environment that could weaken security.")
+    if os.environ.get("SHIELD_INSECURE_NO_SANDBOX") == "1":      # only for CI containers that run as root
+        os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+        STARTUP_WARNINGS.append("The Chromium sandbox is OFF (SHIELD_INSECURE_NO_SANDBOX). Do not browse like this.")
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(_FLAGS + kept).strip()
+
+
+_sanitize_environment()
+
+from PyQt6.QtCore import QAbstractNativeEventFilter, QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QObject, QSize, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPalette, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
@@ -49,7 +95,7 @@ from shield_autofill import VaultBridge, qwebchannel_js
 from shield_core import (
     DOWNLOADS, HOME, QUARANTINE, SEARCH_ENGINES, TRACKERS, VERSION, Events, Guard, Protection, Settings, Shield, Store,
     assess_download, clean_name, get_vt_key, is_local_host, load_blocklists, lock_down, make_cookie_filter,
-    site_of, unique_path,
+    mark_of_the_web, site_of, unique_path,
 )
 from shield_filters import ListManager, clean_url
 from shield_pages import Ctx, SchemeHandler, _list_line, _summary_line
@@ -80,6 +126,55 @@ PERM_LABELS = {
     "DesktopVideoCapture": "your screen", "DesktopAudioVideoCapture": "your screen and audio",
     "ClipboardReadWrite": "your clipboard", "Notifications": "notifications",
 }
+
+
+def sandbox_status():
+    """'on' or 'off' for the Chromium sandbox, as far as can be told from outside the engine."""
+    if os.environ.get("QTWEBENGINE_DISABLE_SANDBOX") == "1" or "--no-sandbox" in os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", ""):
+        return "off"
+    if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        return "off"
+    return "on"
+
+
+class _SessionLock(QAbstractNativeEventFilter):
+    """Windows only: lock the password vault the moment the PC is locked or goes to sleep, not after the idle timer."""
+    WM_WTSSESSION_CHANGE, WM_POWERBROADCAST = 0x02B1, 0x0218
+    WTS_SESSION_LOCK, PBT_APMSUSPEND = 0x7, 0x4
+
+    def __init__(self, on_lock):
+        super().__init__()
+        self.on_lock = on_lock
+
+    def nativeEventFilter(self, event_type, message):
+        try:
+            if bytes(event_type) in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+                from ctypes import wintypes
+                msg = wintypes.MSG.from_address(int(message))
+                if (msg.message == self.WM_WTSSESSION_CHANGE and msg.wParam == self.WTS_SESSION_LOCK) \
+                        or (msg.message == self.WM_POWERBROADCAST and msg.wParam == self.PBT_APMSUSPEND):
+                    self.on_lock()
+        except Exception:
+            pass
+        return False, 0
+
+
+def watch_session_lock(win):
+    """Ask Windows to tell this window when the session is locked, and lock the vault when it does."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        fn = ctypes.windll.wtsapi32.WTSRegisterSessionNotification
+        fn.argtypes = [wintypes.HWND, wintypes.DWORD]
+        fn.restype = wintypes.BOOL
+        fn(int(win.winId()), 0)             # 0 = this session only
+        flt = _SessionLock(win.lock_vault_now)
+        QApplication.instance().installNativeEventFilter(flt)
+        return flt
+    except Exception:
+        return None
 
 
 class SafePage(QWebEnginePage):
@@ -139,14 +234,17 @@ class SafePage(QWebEnginePage):
 
     # --- permissions ------------------------------------------------------
     def _perm_new(self, perm):
-        self.b.decide_permission(perm.origin().host(), perm.permissionType().name, perm.grant, perm.deny)
+        o = perm.origin()
+        origin = f"{o.scheme()}://{o.host()}" + (f":{o.port()}" if o.port() > 0 else "")
+        self.b.decide_permission(o.host(), perm.permissionType().name, perm.grant, perm.deny, origin)
 
     def _perm_old(self, origin, feature):
         P = QWebEnginePage.PermissionPolicy
         self.b.decide_permission(
             origin.host(), feature.name,
             lambda: self.setFeaturePermission(origin, feature, P.PermissionGrantedByUser),
-            lambda: self.setFeaturePermission(origin, feature, P.PermissionDeniedByUser))
+            lambda: self.setFeaturePermission(origin, feature, P.PermissionDeniedByUser),
+            f"{origin.scheme()}://{origin.host()}" + (f":{origin.port()}" if origin.port() > 0 else ""))
 
     def _cert_error(self, err):
         self.b.events.add("tls", f"rejected certificate for {err.url().host()}: {err.description()}")
@@ -162,8 +260,11 @@ class SafePage(QWebEnginePage):
             self.b.events.add("navigation", f"blocked {scheme}: navigation")
             return False
         if scheme == "shield":
-            # Web pages may never navigate to internal pages; only the user (typed) or shield:// pages.
-            ok = nav_type == N.NavigationTypeTyped or self.url().scheme() in ("shield", "")
+            # Web pages may never navigate to internal pages; only the user (typed), a shield:// page, or the tab's own
+            # back/forward/reload. A fresh popup has an empty address, which must NOT count as trusted: a website
+            # could open a popup and point it at shield://.
+            ok = nav_type in (N.NavigationTypeTyped, N.NavigationTypeBackForward, N.NavigationTypeReload) \
+                or self.url().scheme() == "shield"
             if not ok:
                 self.b.events.add("navigation", "blocked a website from opening a shield:// page")
             return ok
@@ -199,6 +300,12 @@ class SafePage(QWebEnginePage):
 
     def _after_load(self, ok):
         if ok:
+            return
+        hit = self.b.guard.take_main_block([self.url().toString(), self.requestedUrl().toString()],
+                                           [self.url().host(), self.requestedUrl().host()])
+        if hit:                       # a redirect led somewhere flagged: same warning page as a typed address
+            kind, detail, addr = hit
+            self.show_warning(kind, QUrl(addr), detail)
             return
         req = self.requestedUrl()
         host = req.host().lower()
@@ -331,6 +438,9 @@ class Browser(QMainWindow):
         self._lists_timer.start(30 * 60 * 1000)
         QTimer.singleShot(0, self._recover_downloads)
         self._start_server()
+        notes = list(STARTUP_WARNINGS) + (["The Chromium sandbox is off."] if sandbox_status() == "off" and not STARTUP_WARNINGS else [])
+        if notes:
+            QTimer.singleShot(1500, lambda: self.toast(notes[0]))
         try:
             QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self.cfg["theme"] == "system" and self.apply_theme())
         except Exception:
@@ -357,6 +467,13 @@ class Browser(QMainWindow):
         self._cookie_filter = make_cookie_filter(self.cfg, self.events)
         p.cookieStore().setCookieFilter(self._cookie_filter)
         p.setSpellCheckEnabled(False)
+        # Grants are remembered only by Shield, for this session. Without this Qt could store a "yes" on disk and
+        # stop asking, which would bypass the deny-by-default permission broker.
+        if hasattr(p, "setPersistentPermissionsPolicy"):
+            try:
+                p.setPersistentPermissionsPolicy(QWebEngineProfile.PersistentPermissionsPolicy.AskEveryTime)
+            except Exception:
+                pass
 
         A = QWebEngineSettings.WebAttribute
         wanted = {
@@ -367,6 +484,7 @@ class Browser(QMainWindow):
             "HyperlinkAuditingEnabled": False, "DnsPrefetchEnabled": False,
             "AllowWindowActivationFromJavaScript": False, "TouchIconsEnabled": False,
             "FullScreenSupportEnabled": True, "AutoLoadIconsForPage": True,
+            "NavigateOnDropEnabled": False,        # dropping a link or file on a page must not navigate it
         }
         for name, val in wanted.items():
             if hasattr(A, name):
@@ -374,7 +492,9 @@ class Browser(QMainWindow):
 
         self._default_ua = p.httpUserAgent()
         m = re.search(r"Chrome/([\d.]+)", self._default_ua)
-        self.ctx.engine = {"chromium": m.group(1) if m else "unknown", "flags": " ".join(_FLAGS)}
+        self.ctx.engine = {"chromium": m.group(1) if m else "unknown", "flags": " ".join(_FLAGS),
+                           "hardened": HARDENED, "warnings": list(STARTUP_WARNINGS),
+                           "sandbox": sandbox_status()}
         self.rebuild_scripts()
 
     def rebuild_scripts(self):
@@ -905,9 +1025,9 @@ class Browser(QMainWindow):
         s.present()
 
     # -------------------------------------------------------------- permissions
-    def decide_permission(self, host, name, grant, deny):
+    def decide_permission(self, host, name, grant, deny, origin=None):
         label = PERM_LABELS.get(name, name)
-        key = (host, name)
+        key = (origin or host, name)       # per origin (scheme, host and port), so http://x and https://x never share a grant
         if key in self.session_perms:
             (grant if self.session_perms[key] else deny)()
             return
@@ -1048,12 +1168,14 @@ class Browser(QMainWindow):
             self.scan_live[did] = {"stage": stage, "label": label}
 
         def work():
+            sha = size = None
             try:
                 sha, size = sha256_file(path)
                 res = self.scanner.scan(str(path), name, url, mime, progress=say, enabled=enabled)
                 out = {"sha": sha, "size": size, "scan": res}
             except Exception as e:  # a broken scanner must never leave the file stuck
-                out = {"gone": True} if not Path(path).exists() else {"error": f"{type(e).__name__}: {str(e)[:160]}"}
+                out = {"gone": True} if not Path(path).exists() else \
+                    {"error": f"{type(e).__name__}: {str(e)[:160]}", "sha": sha, "size": size}   # keep the fingerprint for release
             self.bridge.scan_done.emit(did, out)
         threading.Thread(target=work, daemon=True).start()
 
@@ -1074,7 +1196,8 @@ class Browser(QMainWindow):
             scan = {"verdict": "unverified", "headline": "Couldn't scan this file", "summary": out["error"],
                     "findings": [], "engines": [], "kind": ext_kind(row["name"]), "version": 1}
             size = Path(row["path"]).stat().st_size if row["path"] and Path(row["path"]).exists() else 0
-            self.store.update_download(did, state="quarantined", size=size, scan=json.dumps(scan), verdict="unverified")
+            self.store.update_download(did, state="quarantined", size=out.get("size") or size, scan=json.dumps(scan),
+                                       verdict="unverified", sha256=out.get("sha") or "")
         else:
             scan = out["scan"]
             self.store.update_download(did, state="quarantined", sha256=out["sha"], size=out["size"],
@@ -1316,6 +1439,12 @@ class Browser(QMainWindow):
                if not v.unlocked else f"{n} saved login{'s' if n != 1 else ''} for this site" if n else "Passwords")
         self.vault_btn.setToolTip(tip)
 
+    def lock_vault_now(self):
+        if self.vault.unlocked:
+            self.vault.lock()
+            self._vault_ui()
+            self.toast("Vault locked")
+
     def copy_secret(self, text):
         """Copy to the clipboard, keep it out of Windows clipboard history, and clear it after 30 seconds."""
         mime = QMimeData()
@@ -1403,7 +1532,8 @@ class Browser(QMainWindow):
 
         def result(r):
             msg = {"ok": "Filled", "noform": "There's no login form on this page",
-                   "cross": "This form would send your password to another site, so Shield didn't fill it"}.get(r, "Couldn't fill this form")
+                   "cross": "This form would send your password to another site, so Shield didn't fill it",
+                   "hidden": "The password box on this page isn't visible, so Shield didn't fill it"}.get(r, "Couldn't fill this form")
             if r == "ok":
                 try:
                     v.mark_used(eid)
@@ -1680,6 +1810,21 @@ class Browser(QMainWindow):
             inst = "0"
         return base, inst
 
+    @staticmethod
+    def _engine_major():
+        """Chromium major version of the engine's newest security patches (0 if Qt can't say). The base version
+        Qt reports is older than this and would make the engine look less patched than it is."""
+        try:
+            from PyQt6 import QtWebEngineCore as wc
+            fn = getattr(wc, "qWebEngineChromiumSecurityPatchVersion", None) or wc.qWebEngineChromiumVersion
+            return int(str(fn()).split(".")[0])
+        except Exception:
+            return 0
+
+    def _engine_stale(self, state):
+        floor, have = int(state.get("min_chromium") or 0), self._engine_major()
+        return bool(floor and have and have < floor)
+
     def _state_path(self):
         return HOME / "update-state.json"
 
@@ -1697,7 +1842,9 @@ class Browser(QMainWindow):
 
     def _update_startup(self):
         shield_update.cleanup(HOME / "updates")
-        if self.cfg["check_updates"] and shield_update.due(self._state_path()):
+        a = self._upd.get("app") or {}
+        urgent = bool(a.get("critical") and a.get("newer"))     # a security release is waiting: ask at every start
+        if self.cfg["check_updates"] and (urgent or shield_update.due(self._state_path())):
             self._run_update_check()
 
     def _run_update_check(self):
@@ -1713,16 +1860,23 @@ class Browser(QMainWindow):
             try:
                 m = shield_update.check_app(VERSION, VERSION)
                 res["app"] = m
+                res["min_chromium"] = m.get("min_chromium", 0)
+                res["ok_ts"] = time.time()               # last time the signed update information was read successfully
                 res.pop("app_err", None)
             except shield_update.UpdateError as e:
                 res["app_err"] = str(e)
         res["ts"] = time.time()
         self._upd = res
         shield_update.mark(self._state_path(), **{k: v for k, v in res.items() if k != "ts"})
-        if res.get("newer"):
+        app = res.get("app") or {}
+        if self._engine_stale(res):
+            self.bridge.say.emit("This copy of Shield's web engine is out of date. Install the newest Shield now: Settings > Updates.")
+        elif app.get("newer") and app.get("critical"):
+            self.bridge.say.emit(f"Shield {app['version']} fixes a serious security problem. Please install it now: Settings > Updates.")
+        elif res.get("newer"):
             self.bridge.say.emit("A newer web engine is available. See Settings > Updates.")
-        elif (res.get("app") or {}).get("newer"):
-            self.bridge.say.emit(f"Shield {res['app']['version']} is available. See Settings > Updates.")
+        elif app.get("newer"):
+            self.bridge.say.emit(f"Shield {app['version']} is available. See Settings > Updates.")
 
     def update_state(self):
         base, inst = self._engine_versions()
@@ -1737,7 +1891,10 @@ class Browser(QMainWindow):
                      if u["newer"] else ". Up to date.")
         elif not self.cfg["check_updates"]:
             line += ". Update checks are off."
-        out = {"engine": line, "app": "", "app_new": False, "can_install": CAN_INSTALL}
+        if self._engine_stale(u):
+            line += f". This web engine is older than the {u['min_chromium']} that Shield now requires. Install the newest Shield."
+        out = {"engine": line, "app": "", "app_new": False, "can_install": CAN_INSTALL,
+               "engine_stale": self._engine_stale(u)}
         if shield_update.configured():
             a = u.get("app")
             if u.get("app_err"):
@@ -1747,6 +1904,11 @@ class Browser(QMainWindow):
             elif a:
                 out["app_new"] = bool(a.get("newer"))
                 out["app"] = (f"Version {a['version']} is available. {a['notes']}" if a.get("newer") else f"You have the newest version ({VERSION}).")
+                if a.get("newer") and a.get("critical"):
+                    out["app"] = "Important security update. " + out["app"]
+            ok_ts = u.get("ok_ts")
+            if self.cfg["check_updates"] and ok_ts and time.time() - ok_ts > 14 * 86400 and not u.get("app_err"):
+                out["app"] = (out["app"] + " ").lstrip() + f"Shield hasn't been able to read update information for {int((time.time() - ok_ts) // 86400)} days."
         return out
 
     def update_check(self):
@@ -1806,9 +1968,15 @@ class Browser(QMainWindow):
         row = self.store.download(did)
         if not row or row["state"] != "quarantined":
             return False, "Not in quarantine" if not row or row["state"] != "scanning" else "Still scanning"
-        risky = any(f[0] == "danger" for f in _j(row["flags"], [])) or row["verdict"] in ("danger", "malicious")
-        if risky and not confirm:
+        # Only a file that was scanned and came back clearly fine leaves quarantine on one click. Anything flagged,
+        # unsigned-and-unknown, partly scanned or downloaded over a warning needs an explicit second confirmation.
+        flags = _j(row["flags"], [])
+        needs_confirm = row["verdict"] not in ("trusted", "clean", "checked") or any(f[0] in ("danger", "warn") for f in flags)
+        if needs_confirm and not confirm:
             return False, "confirm"
+        expected = (row["sha256"] or "").lower()
+        if not expected:
+            return False, "This file has no stored fingerprint, so Shield can't prove it is unchanged. Delete it and download it again."
         src = Path(row["path"])
         if not src.exists():
             self.store.update_download(did, state="missing")
@@ -1820,6 +1988,22 @@ class Browser(QMainWindow):
         except OSError:
             pass
         shutil.move(str(src), str(dst))
+        # Prove that what now sits in Downloads is exactly the file that was scanned. Hashing the file after the move
+        # (not before) leaves no gap in which something could swap it.
+        try:
+            got = sha256_file(dst)[0].lower()
+        except OSError:
+            got = ""
+        if got != expected:
+            try:
+                os.chmod(dst, 0o600)
+                os.remove(dst)
+            except OSError:
+                pass
+            self.store.update_download(did, state="blocked", verdict="malicious")
+            self.events.add("download", f"{dst.name} changed after it was scanned: deleted")
+            return False, "This file changed after Shield checked it, so it was deleted. Download it again."
+        mark_of_the_web(dst, row["url"])      # keep the 'from the internet' tag, even if the file crossed drives
         self.store.update_download(did, state="released", path=str(dst))
         self.events.add("download", f"released {dst.name}")
         return True, ""
@@ -1947,11 +2131,34 @@ def selftest(out_path):
         need(len(js) > 1000, "qwebchannel.js is missing")
         return f"{len(js)} bytes"
 
+    def vault_ok():
+        """The password vault's cryptography (Argon2id + AES-GCM) works in this packed build: create, lock, reopen, rekey."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            v = shield_vault.Vault(str(Path(d) / "t.shv"))
+            v.create("selftest-master-pw")
+            v.add("https://example.com", "u", "p")
+            v.lock()
+            need(not v.unlock("wrong-master-pass"), "a wrong password opened the vault")
+            need(v.unlock("selftest-master-pw"), "the right password did not open the vault")
+            need(v.change_master("selftest-master-pw", "selftest-master-pw-2"), "changing the master password failed")
+            v.lock()
+            need(v.unlock("selftest-master-pw-2") and len(v.entries) == 1, "the vault did not reopen after rekeying")
+        return "ok"
+
+    def engine_ok():
+        """Reports the web engine's security-patch level, which is what the signed min_chromium floor is compared with."""
+        major = Browser._engine_major()
+        need(major > 0, "Qt could not report the engine's patch level")
+        return f"Chromium security-patch major {major}"
+
     app = QApplication(sys.argv)
     check("yara", yara_ok)
     check("pefile", pe_ok)
     check("update signatures", sign_ok)
     check("webchannel script", channel_ok)
+    check("vault cryptography", vault_ok)
+    check("engine patch level", engine_ok)
     check("icons", lambda: need(not pix("shield-check", QColor("#ffffff"), 24, 1.0).isNull(), "icon rendering failed") or "ok")
 
     # the web engine itself: start it, load a page, run script in it
@@ -2028,6 +2235,10 @@ def main():
         if sys.stdout:
             print(f"Shield {VERSION}")
         return
+    if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0 and os.environ.get("SHIELD_INSECURE_NO_SANDBOX") != "1":
+        if sys.stderr:
+            print("Shield won't run as the root user: the Chromium sandbox can't be used that way. Run it as a normal user.", file=sys.stderr)
+        sys.exit(2)
     sys.excepthook = _log_exception   # without this, PyQt6 aborts the whole process on any unhandled error in a slot
     _windows_identity()
     register_scheme()
@@ -2053,6 +2264,7 @@ def main():
         app._open_events = _OpenEvents(win)
         app.installEventFilter(app._open_events)
     win.show()
+    app._session_lock = watch_session_lock(win)       # keeps the Windows lock-screen watcher alive (None elsewhere)
     QTimer.singleShot(0, lambda: win.cur().setFocus())
     sys.exit(app.exec())
 

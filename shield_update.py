@@ -38,6 +38,22 @@ newer builds pick their own entry from "platforms"):
                    "macos-x64":   {"url": "...", "sha256": "..."},
                    "linux-x64":   {"url": "...", "sha256": "..."}}}
 Host manifest.json and manifest.json.sig side by side; UPDATE_URL points at manifest.json.
+
+Three optional fields in the signed manifest make the channel harder to attack and tell old copies of Shield when
+their web engine has fallen behind:
+
+    "expires": 1798761600            a Unix time (or "2027-01-01T00:00:00Z"). After it, the manifest is ignored.
+                                     This stops someone replaying an old, validly signed manifest to hide a newer
+                                     release ("freeze" attack). Put it 30 to 60 days ahead on every release and
+                                     re-sign the same release before it runs out.
+    "min_chromium": 140              the oldest Chromium security-patch level still considered safe. Copies whose
+                                     engine is older show a warning (see Security center) until they update.
+    "critical": true                 this release fixes something serious: Shield says so and asks for the update
+                                     at every start instead of once a day.
+
+Backup signing key: put the public key of a second, offline-only keypair in UPDATE_BACKUP_PUBKEYS. A manifest signed by
+either key is trusted. If the main key is ever lost or leaked, release one build with the backup key promoted to
+UPDATE_PUBKEY and a fresh backup, signed with the backup key, and nobody is stranded.
 """
 from __future__ import annotations
 
@@ -64,6 +80,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 
 UPDATE_URL = "https://github.com/Daddddyn/shield/releases/download/shield/manifest.json"          # e.g. "https://downloads.example.org/shield/manifest.json"
 UPDATE_PUBKEY = "tt5sBOeH5AmHJsedB02yh40HHiWr6/A96XQyS9cGdvU="       # base64 of the 32-byte public key printed by `keygen`
+UPDATE_BACKUP_PUBKEYS = ("lO5r4u0NuZwCjPcKLR0gp8MpJcUXItTW5PryQDEozwE=",)      # base64 public keys of offline backup signing keys (see the notes at the top)
 PYPI_URL = "https://pypi.org/pypi/PyQt6-WebEngine/json"
 MAX_MANIFEST = 64 * 1024
 MAX_INSTALLER = 600 * 1024 * 1024
@@ -125,18 +142,51 @@ def check_engine(installed, version="0", fetch=None):
 
 
 # -- Shield itself ---------------------------------------------------------------
-def verify_manifest(raw, sig_b64, pubkey_b64):
-    """The parsed manifest if the signature is valid, else raises UpdateError."""
+def _keys(pubkeys):
+    """Accept one base64 key or several; ignore empty entries."""
+    if isinstance(pubkeys, (str, bytes)):
+        pubkeys = [pubkeys]
+    return [k for k in (pubkeys or ()) if k]
+
+
+def _parse_expiry(value):
+    """Unix seconds from a number or an ISO-8601 'Z' time. 0 means 'no expiry'. Raises ValueError if unreadable."""
+    if value in (None, "", 0):
+        return 0.0
+    if isinstance(value, bool):
+        raise ValueError
+    if isinstance(value, (int, float)):
+        return float(value)
+    import calendar
+    return float(calendar.timegm(time.strptime(str(value).strip(), "%Y-%m-%dT%H:%M:%SZ")))
+
+
+def verify_manifest(raw, sig_b64, pubkey_b64, now=None):
+    """The parsed manifest if the signature is valid (under any trusted key) and it has not expired, else raises UpdateError."""
+    sig = None
     try:
-        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pubkey_b64))
-        pub.verify(base64.b64decode(sig_b64.strip()), raw)
-    except (InvalidSignature, ValueError, TypeError):
-        raise UpdateError("The update information isn't signed by the right key, so it was ignored") from None
+        sig = base64.b64decode(sig_b64.strip())
+    except (ValueError, TypeError):
+        pass
+    ok = False
+    for key in _keys(pubkey_b64):
+        try:
+            Ed25519PublicKey.from_public_bytes(base64.b64decode(key)).verify(sig or b"", raw)
+            ok = True
+            break
+        except (InvalidSignature, ValueError, TypeError):
+            continue
+    if not ok:
+        raise UpdateError("The update information isn't signed by the right key, so it was ignored")
     try:
         m = json.loads(raw.decode("utf-8"))
         ver, url, sha = str(m["version"]), str(m["url"]), str(m["sha256"]).lower()
-    except (ValueError, KeyError, TypeError):
+        expires = _parse_expiry(m.get("expires"))
+        min_chromium = int(m.get("min_chromium") or 0)
+    except (ValueError, KeyError, TypeError, AttributeError):
         raise UpdateError("The update information is malformed") from None
+    if expires and (now if now is not None else time.time()) > expires:
+        raise UpdateError("The update information has expired, so it was ignored. Check Shield's website for the newest version")
     if not re.fullmatch(r"[0-9a-f]{64}", sha) or not url.lower().startswith("https://") or not vtuple(ver)[0]:
         raise UpdateError("The update information is malformed")
     plats = {}
@@ -148,7 +198,12 @@ def verify_manifest(raw, sig_b64, pubkey_b64):
             continue
         if re.fullmatch(r"[a-z0-9_]+-[a-z0-9_]+", str(key)) and re.fullmatch(r"[0-9a-f]{64}", ps) and pu.lower().startswith("https://"):
             plats[str(key)] = {"url": pu, "sha256": ps}
-    return {"version": ver, "url": url, "sha256": sha, "notes": str(m.get("notes", ""))[:400], "platforms": plats}
+    return {"version": ver, "url": url, "sha256": sha, "notes": str(m.get("notes", ""))[:400], "platforms": plats,
+            "expires": expires, "min_chromium": max(0, min(min_chromium, 10000)), "critical": m.get("critical") is True}
+
+
+def trusted_keys():
+    return _keys([UPDATE_PUBKEY, *UPDATE_BACKUP_PUBKEYS])
 
 
 def configured():
@@ -158,8 +213,8 @@ def configured():
 def check_app(current, version="0", url=None, pubkey=None, fetch=None, plat=None):
     """{'version', 'url', 'sha256', 'notes', 'newer', 'platform', 'no_build'} for the signed manifest, with url and
     sha256 pointing at the installer for THIS system. Raises UpdateError."""
-    url, pubkey = url or UPDATE_URL, pubkey or UPDATE_PUBKEY
-    if not (url and pubkey):
+    url, pubkey = url or UPDATE_URL, pubkey or trusted_keys()
+    if not (url and _keys(pubkey)):
         raise UpdateError("Updates aren't set up for this build")
     get = fetch or (lambda u, lim: _get(u, lim, version))
     raw = get(url, MAX_MANIFEST)

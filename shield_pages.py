@@ -361,6 +361,8 @@ def page_settings(ctx, q):
                  "Off means cookies and site data are wiped on exit, which is the most private. Needs a restart.")
         + toggle(c, "clear_on_exit", "Clear cookies and cache when Shield closes",
                  "Only matters if you stay signed in between sessions. Sites will ask you to sign in again.")
+        + toggle(c, "hardened_mode", "Hardened mode (no JIT)",
+                 "Runs JavaScript without the JIT compiler, which most browser exploits rely on. Heavy pages, games and web apps run slower, and WebAssembly stops working. Needs a restart.")
     )
     app0 = ctx.app
     summ = app0.protection_summary() if app0 else {"network": 0, "cosmetic": 0, "threats": 0, "ready": False}
@@ -517,6 +519,7 @@ LAYERS = [
     ("Navigation guard", lambda c: c["navigation_guard"], "Lookalike, international-character and blocked-site warnings."),
     ("Permission broker", lambda c: True, "Camera, mic, location and others: deny by default or ask, with session-only grants."),
     ("Process isolation", lambda c: True, "Site-per-process and strict origin isolation, Chromium sandbox on."),
+    ("Hardened mode (no JIT)", lambda c: c["hardened_mode"], "JavaScript runs without the JIT compiler, closing the biggest class of browser exploits. Slower pages. Off by default."),
     ("Hardened internal pages", lambda c: True, "Private scheme, secret tokens, strict CSP, escaped output."),
     ("No tracking of you", lambda c: True, "No accounts, sync, usage stats or crash uploads. The only background requests fetch protection lists and update checks, and you can switch both off."),
 ]
@@ -542,7 +545,9 @@ def page_security(ctx, q):
 <h2>Protection layers</h2><div class="group">{rows}</div>
 <h2>Protection lists</h2><div class="group">{_item("Loaded now", f'<span id="prot">{esc(_summary_line(ctx.app.protection_summary() if ctx.app else {}))}</span>', '<a class="btn" href="shield://settings#lists">Manage</a>')}</div>
 <h2>Engine</h2><div class="group">{_item(f"Chromium {esc(ctx.engine['chromium'])}", f'<span class="mono">{esc(ctx.engine["flags"])}</span>')}
-{_item("Web engine version", '<span id="engline">Checking</span>')}</div>
+{_item("Web engine version", '<span id="engline">Checking</span>')}
+{_item("Chromium sandbox", "The engine's own security sandbox for web pages.", f'<span class="chip {"ok" if ctx.engine.get("sandbox") == "on" else "bad"}">{"On" if ctx.engine.get("sandbox") == "on" else "OFF"}</span>')}
+{"".join(_item("Startup warning", esc(w)) for w in ctx.engine.get("warnings", []))}</div>
 <h2>Most blocked domains</h2><div class="group" id="doms"></div>
 <h2>Recent events</h2><div class="group" id="log"></div>
 """
@@ -603,7 +608,7 @@ function actions(d){const id=d.id,a=[];const folder=h("button",{class:"btn icon 
  const del=h("button",{class:"btn ghost dng",onclick:()=>{collapse(id);api("download/delete",{id})}},ic("trash",15),"Delete");
  if(d.state==="quarantined"){const risky=d.verdict==="danger"||d.verdict==="malicious";
   a.push(h("button",{class:"btn "+(risky?"dng":"pri"),onclick:async()=>{let r=await api("download/release",{id});
-   if(!r.ok&&r.err==="confirm"){const x=await sheet({icon:"shield-alert",tone:"bad",title:"Release a flagged file?",body:d.verdict==="malicious"?"A scanner identified this file as malware. Releasing it moves it out of quarantine, where it can run.":"Shield found signs this file is disguised or unsafe. Releasing it moves it out of quarantine, where it can run.",actions:[{label:"Release anyway",kind:"dng fill",value:"ok"},{label:"Keep in quarantine",kind:"ghost",value:null}]});if(x!=="ok")return;r=await api("download/release",{id,confirm:"1"})}
+   if(!r.ok&&r.err==="confirm"){const x=await sheet({icon:"shield-alert",tone:"bad",title:d.verdict==="danger"||d.verdict==="malicious"?"Release a flagged file?":"Release a file Shield couldn't vouch for?",body:d.verdict==="malicious"?"A scanner identified this file as malware. Releasing it moves it out of quarantine, where it can run.":d.verdict==="danger"?"Shield found signs this file is disguised or unsafe. Releasing it moves it out of quarantine, where it can run.":"Shield couldn't confirm this file is safe: it may be unsigned and unknown, only partly checked, or have come with a warning. Only release it if you trust where it came from.",actions:[{label:"Release anyway",kind:"dng fill",value:"ok"},{label:"Keep in quarantine",kind:"ghost",value:null}]});if(x!=="ok")return;r=await api("download/release",{id,confirm:"1"})}
    if(r.ok){toast("Released to Downloads");poll(true)}else toast(r.err||"Couldn't release")}},"Release"),del,folder)}
  else if(d.state==="released")a.push(folder);
  else if(d.state==="scanning"||d.state==="downloading"){}
@@ -898,7 +903,7 @@ PAGES = {"newtab": page_newtab, "settings": page_settings, "security": page_secu
 # JSON API used by the internal pages
 # --------------------------------------------------------------------------
 def handle_api(ctx, path, q):
-    if q.get("t") != ctx.token:
+    if not secrets.compare_digest(str(q.get("t", "")).encode("utf-8", "replace"), ctx.token.encode("ascii")):
         return {"ok": False, "err": "bad token"}
     c, app = ctx.cfg, ctx.app
     if path == "events":
@@ -909,7 +914,7 @@ def handle_api(ctx, path, q):
         if ok:
             app.on_setting(key)
         return {"ok": ok, "theme": app.resolved_theme(),
-                "note": "Saved. Restart Shield to apply." if key == "persistent_sessions" else ""}
+                "note": "Saved. Restart Shield to apply." if key in ("persistent_sessions", "hardened_mode") else ""}
     if path == "site/add":
         return {"ok": c.add_rule(q.get("host", ""), q.get("rule", ""))}
     if path == "site/del":
@@ -992,6 +997,18 @@ class SchemeHandler(QWebEngineUrlSchemeHandler):
         super().__init__(parent)
         self.ctx = ctx
 
+    @staticmethod
+    def _harden(job, mime):
+        """Response headers for internal pages: never cached, never sniffed, never framed, no referrer."""
+        try:
+            from PyQt6.QtCore import QByteArray
+            h = {b"Cache-Control": b"no-store", b"X-Content-Type-Options": b"nosniff", b"Referrer-Policy": b"no-referrer"}
+            if mime == b"text/html":
+                h[b"X-Frame-Options"] = b"DENY"
+            job.setAdditionalResponseHeaders({QByteArray(k): QByteArray(v) for k, v in h.items()})
+        except Exception:
+            pass          # older Qt without this call: the page-level CSP still applies
+
     def requestStarted(self, job):
         Err = QWebEngineUrlRequestJob.Error
         try:
@@ -1016,6 +1033,7 @@ class SchemeHandler(QWebEngineUrlSchemeHandler):
             buf = QBuffer(job)
             buf.setData(data)
             buf.open(QIODevice.OpenModeFlag.ReadOnly)
+            self._harden(job, mime)
             job.reply(mime, buf)
         except Exception:
             job.fail(Err.RequestFailed)

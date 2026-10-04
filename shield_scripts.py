@@ -116,6 +116,9 @@ const report=()=>{
  const k=JSON.stringify(d);if(k===lastSeen)return;lastSeen=k;send("seen",d)};
 const later=()=>{clearTimeout(timer);timer=setTimeout(report,450)};
 
+// Only real user actions count. A page can fire fake submit, click and Enter events at will; without this check it
+// could make Shield pop up save prompts for logins the person never sent, or time them to confuse the person.
+const real=e=>e&&e.isTrusted===true;
 const capture=()=>{
  const ps=passFields();if(!ps.length)return;
  let kind="login",pw=ps[0].value,old="";
@@ -128,24 +131,41 @@ const capture=()=>{
  const k=JSON.stringify(d),now=Date.now();
  if(k===lastSent&&now-lastAt<2500)return;lastSent=k;lastAt=now;send("captured",d)};
 
-document.addEventListener("submit",e=>{if(e.target&&e.target.querySelector&&e.target.querySelector("input[type=password]"))capture()},true);
+document.addEventListener("submit",e=>{if(real(e)&&e.target&&e.target.querySelector&&e.target.querySelector("input[type=password]"))capture()},true);
 document.addEventListener("click",e=>{
+ if(!real(e))return;
  const t=e.target&&e.target.closest&&e.target.closest("button,input[type=submit],input[type=image],[role=button]");
  if(!t)return;const f=t.form||t.closest("form")||document;
  if(f.querySelector&&f.querySelector("input[type=password]")&&(t.type==="submit"||t.tagName==="BUTTON"||t.getAttribute("role")==="button"))capture()},true);
 document.addEventListener("keydown",e=>{
- if(e.key!=="Enter"||!e.target||e.target.tagName!=="INPUT")return;
+ if(!real(e)||e.key!=="Enter"||!e.target||e.target.tagName!=="INPUT")return;
  const ps=passFields();if(!ps.length)return;
  if(ps.includes(e.target)||(e.target.form&&e.target.form===ps[0].form))capture()},true);
 
+// A field a person can actually see and click: big enough, on screen, not faded out, not covered by something else.
+// Invisible or covered password fields are how pages harvest autofilled logins without the person noticing.
+const seen=e=>{
+ try{
+  if(!vis(e))return false;
+  const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+  if(r.width<20||r.height<10||parseFloat(s.opacity)<.5||s.pointerEvents==="none")return false;
+  if(r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth)return false;
+  const x=Math.min(Math.max(r.left+r.width/2,0),innerWidth-1),y=Math.min(Math.max(r.top+r.height/2,0),innerHeight-1);
+  const top=document.elementFromPoint(x,y);
+  if(!top)return false;
+  if(top===e||e.contains(top)||top.contains(e))return true;
+  const lab=e.labels&&[...e.labels].some(l=>l===top||l.contains(top));
+  return !!lab;
+ }catch(x){return false}};
 // Fill: called by the browser, only after the person picked a login from the key menu.
 window.__shieldFill=(user,pw)=>{
  const ps=passFields();if(!ps.length)return"noform";
- const p=ps[0];
+ const p=ps.find(seen);
+ if(!p)return"hidden";
  if(actionOrigin(p)!==location.origin)return"cross";
  const set=(el,v)=>{const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value");d.set.call(el,v);el.dispatchEvent(new Event("input",{bubbles:true}));el.dispatchEvent(new Event("change",{bubbles:true}))};
  const u=userField(p);
- if(u&&user)set(u,user);
+ if(u&&user&&seen(u))set(u,user);
  set(p,pw);
  return"ok"};
 
