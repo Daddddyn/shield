@@ -87,7 +87,8 @@ try {
 } catch { }
 
 Write-Host ""
-Write-Host "Now upload them by hand to the GitHub release named 'shield':" -ForegroundColor Green
+Write-Host "To publish them automatically run: packaging\4-upload.ps1" -ForegroundColor Green
+Write-Host "Or upload them by hand to the GitHub release named 'shield':" -ForegroundColor Green
 Write-Host "  https://github.com/Daddddyn/shield/releases/tag/shield   (Edit the release, drag the files in)"
 Write-Host "  Upload the 4 installers first and manifest.json + manifest.json.sig LAST. Replace the older files with the same names."
 Start-Process explorer.exe -ArgumentList "`"$upload`""
