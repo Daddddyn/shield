@@ -49,6 +49,8 @@ DEFAULTS = {
     "search_engine": "duckduckgo",
     "https_only": True,
     "block_trackers": True,
+    "block_site_ads": True,           # block ads on websites; off = ads show, trackers stay blocked
+    "block_youtube_ads": True,        # strip video ads from YouTube's player (shield_scripts.YT_JS)
     "block_third_party_cookies": True,
     "block_local_network": True,
     "fingerprint_protection": True,
@@ -197,6 +199,16 @@ TRACKERS = {
     "bluekai.com", "demdex.net", "everesttech.net", "mathtag.com", "segment.io",
     "mixpanel.com", "fullstory.com", "mouseflow.com", "clarity.ms", "ads-twitter.com",
     "analytics.tiktok.com", "ads.linkedin.com", "snap.licdn.com", "bat.bing.com",
+}
+
+
+# The ad-serving networks among TRACKERS. When the person lets websites show ads these are let through, and the rest
+# (analytics, session recording, cross-site tracking) stay blocked.
+AD_NETWORKS = {
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com", "googletagservices.com", "adnxs.com",
+    "taboola.com", "outbrain.com", "criteo.com", "criteo.net", "amazon-adsystem.com", "adsrvr.org",
+    "rubiconproject.com", "pubmatic.com", "openx.net", "casalemedia.com", "moatads.com", "everesttech.net",
+    "mathtag.com", "ads-twitter.com", "ads.linkedin.com",
 }
 
 
@@ -468,7 +480,8 @@ class Shield(QWebEngineUrlRequestInterceptor):
         # 3. Ads, trackers and known-bad hosts (never on a site the user turned blocking off for).
         if not main and first and ("noblock" not in self.g.rules_for(first)):
             third = site_of(host) != site
-            if s["block_trackers"] and third and host_in(host, TRACKERS):
+            if s["block_trackers"] and third and host_in(host, TRACKERS) \
+                    and (s["block_site_ads"] or not host_in(host, AD_NETWORKS)):
                 info.block(True)
                 self.ev.add("tracker", host, site_of(first), log=False)
                 return

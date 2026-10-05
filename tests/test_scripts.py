@@ -150,5 +150,127 @@ console.log(JSON.stringify({sent,fill:r,pwSet:pw._v,userSet:user._v}));
         self.assertEqual((out["fill"], out["pwSet"], out["userSet"]), ("ok", "newpw", "bob"))
 
 
+YT_HARNESS = r"""
+const g=globalThis;
+g.window=g;
+g.location={hostname:"%HOST%",protocol:"https:"};
+const state={ad:false,nag:false,removed:[],skipClicks:0,closeClicks:0,played:0};
+const video={playbackRate:1.5,muted:false,paused:true,currentTime:5,play(){state.played++;return Promise.resolve()}};
+const skipBtn={click(){state.skipClicks++}};
+const player={classList:{contains:c=>c==="ad-showing"&&state.ad},
+ querySelector(sel){
+  if(sel==="video.html5-main-video"||sel==="video")return video;
+  if(sel.includes("ytp-skip-ad-button"))return state.ad?skipBtn:null;
+  if(sel.includes("ytp-ad-overlay-close-button"))return null;
+  return null}};
+const nagEl={remove(){state.removed.push("nag")}},backdrop={remove(){state.removed.push("backdrop")}};
+g.document={documentElement:{},head:{appendChild(){}},createElement(){return{}},
+ querySelector(sel){
+  if(sel===".html5-video-player")return player;
+  if(sel==="ytd-enforcement-message-view-model")return state.nag?nagEl:null;
+  if(sel==="tp-yt-iron-overlay-backdrop")return state.nag?backdrop:null;
+  if(sel==="video")return video;
+  return null}};
+g.MutationObserver=class{observe(){}};
+let timer=()=>{};
+g.setInterval=(f)=>{timer=f;return 1};
+class XMLHttpRequest{open(m,u){this.u=u} get responseText(){return this._t} get response(){return this._t}}
+g.XMLHttpRequest=XMLHttpRequest;
+const rawParse=JSON.parse;
+%SCRIPT%
+const ADS=()=>({adPlacements:[1],playerAds:[1],adSlots:[1],videoDetails:{id:"abc"},streamingData:{x:1}});
+const out={};
+(async()=>{
+ out.parsePatched=JSON.parse!==rawParse;
+ // first player data
+ window.ytInitialPlayerResponse=Object.assign(ADS(),{auxiliaryUi:{messageRenderers:{enforcementMessageViewModel:{a:1},keepMe:{b:2}}}});
+ const r=window.ytInitialPlayerResponse;
+ out.init={ads:["adPlacements","playerAds","adSlots"].some(k=>k in r),keeps:!!(r.videoDetails&&r.streamingData),nag:"enforcementMessageViewModel" in r.auxiliaryUi.messageRenderers,keepMe:"keepMe" in r.auxiliaryUi.messageRenderers};
+ // JSON.parse
+ const pr=JSON.parse(JSON.stringify({playerResponse:ADS(),other:1}));
+ out.parse={ads:"adPlacements" in pr.playerResponse,keeps:!!pr.playerResponse.videoDetails&&pr.other===1};
+ out.plain=JSON.stringify(JSON.parse('{"a":[1,2],"b":{"c":3}}'));
+ out.arr=JSON.stringify(JSON.parse('[{"adPlacements":[1]}]'));
+ out.reviver=JSON.parse('{"n":1}',(k,v)=>typeof v==="number"?v+1:v).n;
+ // fetch
+ const mk=(url,obj)=>{const x=new Response(JSON.stringify(obj));Object.defineProperty(x,"url",{value:url});return x};
+ const f1=await mk("https://www.youtube.com/youtubei/v1/player?prettyPrint=false",ADS()).json();
+ const f2=await mk("https://www.youtube.com/youtubei/v1/next",{playerResponse:ADS()}).json();
+ const f4=await mk("https://www.youtube.com/youtubei/v1/reel/reel_watch_sequence",{entries:[{command:{reelWatchEndpoint:{adClientParams:{isAd:true}}}},{command:{reelWatchEndpoint:{videoId:"v1"}}}]}).json();
+ out.fetch={player:"adPlacements" in f1,next:"adPlacements" in f2.playerResponse,reel:f4.entries.length,reelKept:f4.entries[0].command.reelWatchEndpoint.videoId};
+ // XHR
+ const x=new XMLHttpRequest();x.open("POST","https://www.youtube.com/youtubei/v1/player");x.readyState=4;x._t=JSON.stringify(ADS());
+ const xr=rawParse(x.responseText);
+ out.xhr={ads:"adPlacements" in xr,keeps:!!xr.videoDetails,sameTwice:x.responseText===x.responseText};
+ const x2=new XMLHttpRequest();x2.open("GET","https://www.youtube.com/s/player/base.js");x2.readyState=4;x2._t=JSON.stringify(ADS());
+ out.xhrOther="adPlacements" in rawParse(x2.responseText);
+ const x3=new XMLHttpRequest();x3.open("POST","https://www.youtube.com/youtubei/v1/player");x3.readyState=3;x3._t="partial{";
+ out.xhrPartial=x3.responseText;
+ // native look
+ out.native=/native code/.test(Function.prototype.toString.call(JSON.parse))&&/native code/.test(Function.prototype.toString.call(Response.prototype.json));
+ // safety net
+ state.ad=true;timer();
+ out.ad={muted:video.muted,rate:video.playbackRate,skips:state.skipClicks,time:video.currentTime};
+ state.ad=false;timer();
+ out.after={muted:video.muted,rate:video.playbackRate,time:video.currentTime};
+ // blocker dialog
+ state.nag=true;timer();
+ out.nag={removed:state.removed.join(),played:state.played};
+ console.log(JSON.stringify(out));
+})();
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class YouTubeScript(unittest.TestCase):
+    def run_yt(self, host="www.youtube.com"):
+        code = YT_HARNESS.replace("%HOST%", host).replace("%SCRIPT%", S.YT_JS)
+        r = run_js(code)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_ads_are_stripped_everywhere_the_player_gets_data(self):
+        o = self.run_yt()
+        self.assertEqual(o["init"], {"ads": False, "keeps": True, "nag": False, "keepMe": True})
+        self.assertEqual(o["parse"], {"ads": False, "keeps": True})
+        self.assertEqual(o["fetch"], {"player": False, "next": False, "reel": 1, "reelKept": "v1"})
+        self.assertEqual(o["xhr"], {"ads": False, "keeps": True, "sameTwice": True})
+
+    def test_everything_else_is_left_alone(self):
+        o = self.run_yt()
+        self.assertEqual(o["plain"], '{"a":[1,2],"b":{"c":3}}')
+        self.assertEqual(o["arr"], '[{"adPlacements":[1]}]')
+        self.assertEqual(o["reviver"], 2)                     # JSON.parse still honours a reviver
+        self.assertTrue(o["xhrOther"])                        # not a player request: untouched
+        self.assertEqual(o["xhrPartial"], "partial{")         # unfinished download: untouched
+        self.assertTrue(o["native"])
+
+    def test_safety_net_speeds_up_mutes_and_restores_without_seeking(self):
+        o = self.run_yt()
+        self.assertEqual((o["ad"]["muted"], o["ad"]["rate"], o["ad"]["skips"]), (True, 16, 1))
+        self.assertEqual(o["ad"]["time"], 5)                  # never seeks, so it can't cut a real video short
+        self.assertEqual((o["after"]["muted"], o["after"]["rate"], o["after"]["time"]), (False, 1.5, 5))
+
+    def test_blocker_dialog_is_removed_and_video_resumed(self):
+        o = self.run_yt()
+        self.assertEqual(o["nag"], {"removed": "nag,backdrop", "played": 1})
+
+    def test_only_runs_on_youtube(self):
+        for host in ("example.com", "notyoutube.com", "youtube.com.evil.io"):
+            code = YT_HARNESS.replace("%HOST%", host).replace("%SCRIPT%", S.YT_JS)
+            r = run_js(code)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(json.loads(r.stdout.strip().splitlines()[-1])["parsePatched"], host)
+        for host in ("www.youtube.com", "m.youtube.com", "youtube.com"):
+            self.assertTrue(self.run_yt(host)["parsePatched"], host)
+
+    def test_host_helper(self):
+        self.assertTrue(S.is_youtube_host("www.youtube.com") and S.is_youtube_host("YouTube.com."))
+        self.assertFalse(S.is_youtube_host("youtube.com.evil.io") or S.is_youtube_host("notyoutube.com") or S.is_youtube_host(""))
+
+    def test_syntax(self):
+        SyntaxChecks().check("yt", S.YT_JS)
+
+
 if __name__ == "__main__":
     unittest.main()

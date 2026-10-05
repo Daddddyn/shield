@@ -129,6 +129,22 @@ class Interceptor(unittest.TestCase):
         self.assertFalse(self.req("https://ads.example/a.js").blocked)
         self.assertFalse(self.req("https://www.google-analytics.com/a.js").blocked)
 
+    def test_websites_may_show_ads_while_trackers_stay_blocked(self):
+        self.prot.set(None, None)                                    # built-in domains only
+        self.assertTrue(self.req("https://securepubads.doubleclick.net/a.js").blocked)
+        self.assertTrue(self.req("https://www.google-analytics.com/a.js").blocked)
+        self.cfg["block_site_ads"] = False
+        self.assertFalse(self.req("https://securepubads.doubleclick.net/a.js").blocked)
+        self.assertFalse(self.req("https://cdn.taboola.com/a.js").blocked)
+        self.assertTrue(self.req("https://www.google-analytics.com/a.js").blocked)
+        self.assertTrue(self.req("https://api.mixpanel.com/track").blocked)
+        self.cfg["block_trackers"] = False                           # the master switch still wins
+        self.assertFalse(self.req("https://www.google-analytics.com/a.js").blocked)
+
+    def test_ad_networks_are_a_subset_of_the_builtin_list(self):
+        self.assertTrue(C.AD_NETWORKS <= C.TRACKERS)
+        self.assertFalse({"google-analytics.com", "hotjar.com", "mixpanel.com"} & C.AD_NETWORKS)
+
     def test_setting_off(self):
         self.cfg["block_trackers"] = False
         self.assertFalse(self.req("https://ads.example/a.js").blocked)
@@ -198,6 +214,8 @@ class SettingsTests(unittest.TestCase):
         c = C.Settings()
         self.assertTrue(c.set("fingerprint_level", "strict"))
         self.assertFalse(c.set("fingerprint_level", "extreme"))
+        self.assertTrue(c["block_site_ads"] and c["block_youtube_ads"])        # both on by default
+        self.assertTrue(c.set("block_site_ads", "0") and c.set("block_youtube_ads", "off"))
         self.assertTrue(c.set("startup", "restore"))
         self.assertTrue(c.set("vault_autolock", "5") and c["vault_autolock"] == 5)
         self.assertFalse(c.set("vault_autolock", "7"))
@@ -208,6 +226,7 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(c.add_rule("a.example", "bogus"))
         c2 = C.Settings()                                       # persisted
         self.assertEqual((c2["startup"], c2["filter_lists"].get("ads")), ("restore", False))
+        self.assertEqual((c2["block_site_ads"], c2["block_youtube_ads"]), (False, False))
 
 
 def fake_app(cfg):
@@ -269,7 +288,8 @@ class PageJavaScript(unittest.TestCase):
         html = P.PAGES["settings"](make_ctx(), {})
         for needle in ('id="lstupd"', 'id="lstsum"', 'id="engline"', 'id="updchk"', 'data-list="ads"', 'data-list="phishing"',
                        'data-k="fingerprint_level"', 'data-k="startup"', 'data-k="vault_autolock"', 'data-k="clean_links"',
-                       'data-k="block_harmful"', 'data-k="clear_on_exit"', "Protection lists"):
+                       'data-k="block_harmful"', 'data-k="clear_on_exit"', 'data-k="block_site_ads"', 'data-k="block_youtube_ads"',
+                       "Protection lists"):
             self.assertIn(needle, html, needle)
         self.assertNotIn("EasyList", html)                           # only Shield's own brand is shown
         self.assertNotIn("uBlock", html)
@@ -277,7 +297,7 @@ class PageJavaScript(unittest.TestCase):
 
     def test_security_page_mentions_new_layers(self):
         html = P.PAGES["security"](make_ctx(), {})
-        for needle in ("Harmful-site warnings", "Link cleaning", "Ad and tracker blocking", 'id="engline"', "Harmful sites stopped"):
+        for needle in ("Harmful-site warnings", "Link cleaning", "Ad and tracker blocking", "YouTube ad blocking", 'id="engline"', "Harmful sites stopped"):
             self.assertIn(needle, html, needle)
 
     def test_warning_page_texts(self):

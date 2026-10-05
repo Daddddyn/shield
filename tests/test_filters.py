@@ -234,6 +234,30 @@ class Manager(unittest.TestCase):
             self.assertEqual(th.lookup("https://phish.test/login")[0], "phishing")
 
 
+    def test_build_can_leave_out_the_ad_lists(self):
+        with tempfile.TemporaryDirectory() as td:
+            on = ("ads", "general", "hosts", "privacy", "phishing")
+            m = F.ListManager(td, "t", {k["id"]: k["id"] in on for k in F.CATALOG})
+            (m.dir / "ads.txt").write_text("||adserver.test^\n##.ad\n")
+            (m.dir / "general.txt").write_text("||moreads.test^\n")
+            (m.dir / "hosts.txt").write_text("0.0.0.0 hostads.test\n")
+            (m.dir / "privacy.txt").write_text("||tracker.test^\n")
+            (m.dir / "phishing.txt").write_text("https://phish.test/login\n")
+            same = lambda e, h: e.decide(f"https://{h}/a.js", h, "p.com", F.T_SCRIPT, True)[0]
+            eng, th = m.build()
+            self.assertEqual([same(eng, h) for h in ("adserver.test", "moreads.test", "hostads.test", "tracker.test")], ["block"] * 4)
+            eng, th = m.build(skip_ids=F.AD_LIST_IDS)
+            self.assertEqual([same(eng, h) for h in ("adserver.test", "moreads.test", "hostads.test", "tracker.test")],
+                             [None, None, None, "block"])
+            self.assertEqual(th.lookup("https://phish.test/login")[0], "phishing")      # safety lists are untouched
+            self.assertEqual(eng.cosmetic_js("page.com"), "")                           # and so is nothing hidden
+
+    def test_ad_list_ids_exist_in_the_catalog(self):
+        ids = {c["id"] for c in F.CATALOG}
+        self.assertTrue(F.AD_LIST_IDS <= ids)
+        self.assertFalse(F.AD_LIST_IDS & {"privacy", "unbreak", "harmful", "phishing", "malware"})
+
+
 class Speed(unittest.TestCase):
     def test_large_list_is_fast(self):
         import random

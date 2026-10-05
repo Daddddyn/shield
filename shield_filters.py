@@ -671,6 +671,9 @@ CATALOG = [
      "fmt": "domains", "role": "threat", "kind": "phishing", "default": False, "hours": 24},
 ]
 MAX_LIST_BYTES = 80 * 1024 * 1024
+# The lists that exist to remove ads. They are left out of the build when the person lets websites show ads;
+# the Trackers list, the compatibility exceptions and the harmful-site lists stay.
+AD_LIST_IDS = frozenset({"ads", "general", "hosts"})
 
 
 class ListError(Exception):
@@ -795,11 +798,11 @@ class ListManager:
             raise ListError("the list is in an unexpected format")
 
     # -- build ---------------------------------------------------------------
-    def build(self):
-        """Parse every enabled list from disk. Returns (FilterEngine, ThreatDB)."""
+    def build(self, skip_ids=()):
+        """Parse every enabled list from disk (except skip_ids). Returns (FilterEngine, ThreatDB)."""
         eng, threats = FilterEngine(), ThreatDB()
         for it in CATALOG:
-            if not self.is_on(it):
+            if not self.is_on(it) or it["id"] in skip_ids:
                 continue
             try:
                 text = self._data_path(it).read_text("utf-8", "replace")

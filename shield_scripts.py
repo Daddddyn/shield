@@ -5,6 +5,7 @@ and run under Node in the tests.
   FP_JS     fingerprint protection. Runs in the page's own world because it has to change what the page sees.
   VAULT_JS  finds login forms, reports submitted logins to the browser and fills logins the user picked.
             Runs in an isolated world: the page's scripts cannot see it, call it or read its variables.
+  YT_JS     removes YouTube's video ads from the data the player is given. youtube.com only, page's own world.
 """
 
 # --------------------------------------------------------------------------
@@ -181,6 +182,151 @@ if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",
 """
 
 
+# --------------------------------------------------------------------------
+# YouTube ads
+# --------------------------------------------------------------------------
+# YouTube serves its ads from the same servers as the video, so a request filter cannot tell them apart. What does
+# work is changing the data the player is given: the player is handed a JSON document that lists the ads to play
+# ("adPlacements", "playerAds", "adSlots"), and removing those keys before the player reads them means it plays no ads.
+# This is the same technique the uBlock Origin lists use for YouTube, but as one fixed script written here: filter
+# lists can never supply code to run, they only supply addresses and page-hiding selectors.
+#   1. The page's first player data (window.ytInitialPlayerResponse) and every later one (fetch, XHR, JSON.parse
+#      for the player, next-video and Shorts requests) is stripped of its ad lists.
+#   2. The "ad blockers are not allowed" dialog and its Premium upsell are removed before they can show.
+#   3. Page-hiding rules cover the ad boxes that are not part of the video (home-page ads, banners, side ads).
+#   4. A safety net: if an ad still starts playing, it is muted, sped up to the maximum and its skip button is
+#      pressed, then the person's own volume and speed are put back. It never seeks, so it cannot cut a real video short.
+# Runs only on youtube.com, in the page's own world (it has to change what the player sees), once per page load.
+YT_JS = r"""
+(()=>{
+const H=(location.hostname||"").toLowerCase();
+if(!/(^|\.)youtube\.com$/.test(H))return;
+const sec=f=>{try{f()}catch(e){}};
+const origParse=JSON.parse;
+
+// patched functions answer toString() like native ones
+const nat=new WeakMap();
+sec(()=>{
+ const ts=Function.prototype.toString;
+ const tsp=function toString(){const n=nat.get(this);return n!==undefined?n:ts.call(this)};
+ nat.set(tsp,"function toString() { [native code] }");
+ Object.defineProperty(Function.prototype,"toString",{value:tsp,writable:true,configurable:true});
+});
+const mask=(fn,name)=>{nat.set(fn,"function "+name+"() { [native code] }");try{Object.defineProperty(fn,"name",{value:name,configurable:true})}catch(e){}return fn};
+
+// 1. strip the ad lists out of player data
+const AD_KEYS=["adPlacements","playerAds","adSlots"];
+const NAGS=["enforcementMessageViewModel","upsellDialogRenderer"];
+const strip=o=>{
+ for(const k of AD_KEYS)if(k in o){try{delete o[k]}catch(e){}}
+ const m=o.auxiliaryUi&&o.auxiliaryUi.messageRenderers;
+ if(m&&typeof m==="object")for(const k of NAGS)if(k in m){try{delete m[k]}catch(e){}}
+};
+const isAdEntry=e=>{const a=e&&e.command&&e.command.reelWatchEndpoint&&e.command.reelWatchEndpoint.adClientParams;return !!(a&&a.isAd)};
+const prune=o=>{
+ try{
+  if(!o||typeof o!=="object"||Array.isArray(o))return o;
+  strip(o);
+  const pr=o.playerResponse;
+  if(pr&&typeof pr==="object")strip(pr);
+  if(Array.isArray(o.entries)&&o.entries.some(isAdEntry))o.entries=o.entries.filter(e=>!isAdEntry(e));
+ }catch(e){}
+ return o};
+const looksLikePlayerData=x=>"adPlacements" in x||"playerAds" in x||"adSlots" in x||"playerResponse" in x||"entries" in x||"auxiliaryUi" in x;
+const isApi=u=>/\/youtubei\/v1\/(player|next|reel\/|get_watch)/.test(String(u||""));
+
+// the data the page itself starts with
+sec(()=>{
+ let v;
+ Object.defineProperty(window,"ytInitialPlayerResponse",{configurable:true,enumerable:true,
+  get:mask(function(){return v},"get ytInitialPlayerResponse"),
+  set:mask(function(x){v=prune(x)},"set ytInitialPlayerResponse")});
+});
+// data parsed from text
+sec(()=>{
+ JSON.parse=mask(function parse(){
+  const x=origParse.apply(this,arguments);
+  if(x&&typeof x==="object"&&!Array.isArray(x)&&looksLikePlayerData(x))prune(x);
+  return x},"parse");
+});
+// fetch
+sec(()=>{
+ const oj=Response.prototype.json;
+ Response.prototype.json=mask(function json(){
+  const url=this.url;
+  return oj.call(this).then(x=>{try{if(isApi(url))prune(x)}catch(e){}return x})},"json");
+});
+// XMLHttpRequest
+sec(()=>{
+ const X=XMLHttpRequest.prototype,urls=new WeakMap(),cache=new WeakMap();
+ const oo=X.open;
+ X.open=mask(function open(m,u){try{urls.set(this,String(u))}catch(e){}return oo.apply(this,arguments)},"open");
+ const rewrite=(x,v)=>{
+  const u=urls.get(x);
+  if(!u||!isApi(u)||x.readyState!==4)return v;
+  if(v&&typeof v==="object"){prune(v);return v}
+  if(typeof v!=="string")return v;
+  const c=cache.get(x);if(c&&c.src===v)return c.out;
+  let out=v;
+  try{const j=origParse.call(JSON,v);prune(j);out=JSON.stringify(j)}catch(e){}
+  cache.set(x,{src:v,out});return out};
+ for(const p of["responseText","response"]){
+  const d=Object.getOwnPropertyDescriptor(X,p);
+  if(!d||!d.get)continue;
+  const g=d.get;
+  Object.defineProperty(X,p,{configurable:true,enumerable:d.enumerable,get:mask(function(){return rewrite(this,g.call(this))},"get "+p)});
+ }
+});
+
+// 3. hide the ad boxes that are not part of the video
+const HIDE=["#masthead-ad","#player-ads","ytd-ad-slot-renderer","ytd-in-feed-ad-layout-renderer","ytd-promoted-sparkles-web-renderer",
+ "ytd-display-ad-renderer","ytd-banner-promo-renderer","ytd-statement-banner-renderer","ytd-companion-slot-renderer",
+ "ytd-player-legacy-desktop-watch-ads-renderer","ytd-enforcement-message-view-model",".ytp-ad-overlay-container",
+ ".ytp-ad-overlay-slot","[target-id=engagement-panel-ads]"];
+const HIDE_HAS=["ytd-rich-item-renderer:has(ytd-ad-slot-renderer)","tp-yt-paper-dialog:has(ytd-enforcement-message-view-model)"];
+sec(()=>{
+ const css=HIDE.join(",")+"{display:none!important}\n"+HIDE_HAS.join(",")+"{display:none!important}";   // :has() in its own rule so an old engine cannot void the first
+ const go=()=>{
+  try{const sh=new CSSStyleSheet();sh.replaceSync(css);document.adoptedStyleSheets=[...document.adoptedStyleSheets,sh];return}catch(e){}
+  const st=document.createElement("style");st.textContent=css;(document.head||document.documentElement).appendChild(st)};
+ if(document.documentElement)go();
+ else new MutationObserver((_,o)=>{if(document.documentElement){o.disconnect();go()}}).observe(document,{childList:true});
+});
+
+// 2 and 4. the blocker dialog, and the safety net for an ad that still starts
+const q=(root,s)=>{try{return root.querySelector(s)}catch(e){return null}};
+let saved=null,savedVideo=null;
+const tick=()=>{
+ try{
+  const nag=q(document,"ytd-enforcement-message-view-model");
+  if(nag){
+   const bd=q(document,"tp-yt-iron-overlay-backdrop");
+   nag.remove();if(bd)bd.remove();
+   const vid=q(document,"video");
+   if(vid&&vid.paused){const p=vid.play();if(p&&p.catch)p.catch(()=>{})}
+  }
+  const player=q(document,".html5-video-player");
+  const video=player&&(q(player,"video.html5-main-video")||q(player,"video"));
+  if(player&&video&&player.classList.contains("ad-showing")){
+   if(!saved){saved={rate:video.playbackRate,muted:video.muted};savedVideo=video}
+   video.muted=true;
+   try{video.playbackRate=16}catch(e){}
+   const skip=q(player,".ytp-skip-ad-button,.ytp-ad-skip-button,.ytp-ad-skip-button-modern");
+   if(skip)skip.click();
+   const close=q(player,".ytp-ad-overlay-close-button");
+   if(close)close.click();
+  }else if(saved){
+   const v=savedVideo||video;
+   if(v){try{v.playbackRate=saved.rate;v.muted=saved.muted}catch(e){}}
+   saved=null;savedVideo=null;
+  }
+ }catch(e){}
+};
+setInterval(tick,250);
+})();
+"""
+
+
 def fp_script(secret, level):
     """The fingerprint script with this session's secret and the chosen level filled in."""
     level = "strict" if level == "strict" else "standard"
@@ -191,3 +337,9 @@ def fill_call(user, password):
     """JavaScript that fills the form in the isolated world. json.dumps makes both strings safe to embed."""
     import json
     return f"window.__shieldFill({json.dumps(user)},{json.dumps(password)})"
+
+
+def is_youtube_host(host):
+    """True for youtube.com and its subdomains (www, m, music...). Nothing else gets the YouTube script."""
+    host = (host or "").lower().strip(".")
+    return host == "youtube.com" or host.endswith(".youtube.com")

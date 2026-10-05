@@ -97,9 +97,9 @@ from shield_core import (
     assess_download, clean_name, get_vt_key, is_local_host, load_blocklists, lock_down, make_cookie_filter,
     mark_of_the_web, site_of, unique_path,
 )
-from shield_filters import ListManager, clean_url
+from shield_filters import AD_LIST_IDS, ListManager, clean_url
 from shield_pages import Ctx, SchemeHandler, _list_line, _summary_line
-from shield_scripts import VAULT_JS, fill_call, fp_script
+from shield_scripts import VAULT_JS, YT_JS, fill_call, fp_script, is_youtube_host
 from shield_scan import ScanEngine, VirusTotal, VTError, label_for_name, sha256_file
 from shield_ui import (
     Chrome, FindBar, IconButton, Omnibox, Pill, Sheet, T, TabStrip, pix, soften_menu, stylesheet,
@@ -215,10 +215,21 @@ class SafePage(QWebEnginePage):
     def set_cosmetic(self, host):
         """Install the page-cleanup script for the site about to load (it runs before the page builds)."""
         sc = self.scripts()
-        for old in sc.find("shield-cos"):
-            sc.remove(old)
+        for name in ("shield-cos", "shield-yt"):
+            for old in sc.find(name):
+                sc.remove(old)
         b = self.b
-        if not (b.cfg["cosmetic_filtering"] and b.cfg["block_trackers"]) or "noblock" in b.guard.rules_for(host):
+        if "noblock" in b.guard.rules_for(host):
+            return
+        if b.cfg["block_youtube_ads"] and is_youtube_host(host):
+            y = QWebEngineScript()
+            y.setName("shield-yt")
+            y.setSourceCode(YT_JS)
+            y.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+            y.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)     # it has to change what the player sees
+            y.setRunsOnSubFrames(False)
+            sc.insert(y)
+        if not (b.cfg["cosmetic_filtering"] and b.cfg["block_trackers"]):
             return
         eng = b.prot.engine
         js = eng.cosmetic_js(host) if eng is not None else ""
@@ -1066,6 +1077,8 @@ class Browser(QMainWindow):
                 pass
         elif key == "auto_update_lists":
             self._lists_maybe_update()
+        elif key == "block_site_ads":
+            self.lists_changed()                  # rebuild with or without the ad lists
         elif key == "check_updates" and self.cfg["check_updates"]:
             threading.Thread(target=self._run_update_check, daemon=True).start()
 
@@ -1735,7 +1748,7 @@ class Browser(QMainWindow):
 
     # ------------------------------------------------ protection lists and threats
     def _build_protection(self):
-        engine, threats = self.lists.build()
+        engine, threats = self.lists.build(skip_ids=() if self.cfg["block_site_ads"] else AD_LIST_IDS)
         self.prot.set(engine, threats)
 
     def _lists_startup(self):

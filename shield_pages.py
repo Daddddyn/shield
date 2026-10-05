@@ -370,6 +370,12 @@ def page_settings(ctx, q):
         toggle(c, "https_only", "HTTPS-only mode", "Upgrades every http:// request. If a site can't do HTTPS you get a warning instead of a silent downgrade.")
         + toggle(c, "block_trackers", "Block ads and trackers",
                  f"Uses the protection lists below ({summ['network']:,} rules loaded) plus {len(TRACKERS):,} built-in tracking domains. Turn it off for one site from the lock icon.")
+        + toggle(c, "block_site_ads", "Block ads on websites",
+                 "Blocks banner, video and pop-up ads on every site. Turn it off if you want websites to show their ads: "
+                 "trackers stay blocked either way.")
+        + toggle(c, "block_youtube_ads", "Block YouTube ads",
+                 "Removes video and page ads on youtube.com by changing the data YouTube's player is given. YouTube changes its "
+                 "player often, so now and then an ad may get through until Shield is updated. Applies to the next YouTube page you open.")
         + toggle(c, "cosmetic_filtering", "Hide empty ad spaces", "Removes the blank boxes and banners that blocked ads leave behind.")
         + toggle(c, "block_harmful", "Warn about harmful sites", "Warns before known phishing, malware and scam pages open. Matching happens on this computer; the addresses you visit are never sent anywhere.")
         + toggle(c, "clean_links", "Clean tracking out of links", "Removes tracking parameters like utm_ and fbclid when you click a link, and skips redirect pages that only exist to count clicks.")
@@ -511,6 +517,7 @@ LAYERS = [
     ("HTTPS-only", lambda c: c["https_only"], "Plain-HTTP requests are upgraded. Failures show a warning, never a silent downgrade."),
     ("Strict TLS", lambda c: True, "Invalid or expired certificates are always rejected. There is no click-through."),
     ("Ad and tracker blocking", lambda c: c["block_trackers"], "Requests are checked against regularly updated protection lists and dropped."),
+    ("YouTube ad blocking", lambda c: c["block_youtube_ads"], "Video ads are removed from the data YouTube's player is given, with a speed-up-and-skip fallback if one still starts."),
     ("Harmful-site warnings", lambda c: c["block_harmful"], "Known phishing, malware and scam pages are caught before they open, using lists matched on this computer."),
     ("Link cleaning", lambda c: c["clean_links"], "Tracking parameters and click-counting redirects are removed from links you follow."),
     ("Third-party cookie blocking", lambda c: c["block_third_party_cookies"], "Cross-site cookies are refused."),
