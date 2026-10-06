@@ -60,6 +60,10 @@ ICONS = {
     "edit": '<path d="M5 19l1-4.2L16.2 4.6a1.7 1.7 0 0 1 2.4 0l.8.8a1.7 1.7 0 0 1 0 2.4L9.2 18z"/><path d="M14.5 6.3l3.2 3.2"/>',
     "dice": '<rect x="4.5" y="4.5" width="15" height="15" rx="3"/>' + _DOT.format(x=8.7, y=8.7, r=1.1) + _DOT.format(x=15.3, y=8.7, r=1.1) + _DOT.format(x=12, y=12, r=1.1) + _DOT.format(x=8.7, y=15.3, r=1.1) + _DOT.format(x=15.3, y=15.3, r=1.1),
     "image": '<rect x="4" y="5" width="16" height="14" rx="2.2"/><circle cx="9" cy="10" r="1.5"/><path d="M5 17l4.5-4.5 3.5 3.5 2.5-2.5 3.5 3.5"/>',
+    # windows and layout
+    "split": '<rect x="4" y="5" width="16" height="14" rx="2.2"/><path d="M12 5.4v13.2"/>',
+    "window-new": '<rect x="4" y="5" width="16" height="14" rx="2.2"/><path d="M4 9.4h16"/><path d="M12 11.9v4.4M9.8 14.1h4.4"/>',
+    "swap": '<path d="M6.5 8.5h11"/><path d="M14.4 5.2l3.3 3.3-3.3 3.3"/><path d="M17.5 15.5h-11"/><path d="M9.6 12.2l-3.3 3.3 3.3 3.3"/>',
 }
 
 

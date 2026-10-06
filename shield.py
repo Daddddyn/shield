@@ -74,7 +74,10 @@ def _sanitize_environment():
 
 _sanitize_environment()
 
-from PyQt6.QtCore import QAbstractNativeEventFilter, QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QObject, QSize, Qt, QTimer, QUrl, QUrlQuery, pyqtSignal
+from PyQt6.QtCore import (
+    QAbstractNativeEventFilter, QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QObject, QPoint, QPointF, QSize, Qt, QTimer,
+    QUrl, QUrlQuery, pyqtSignal,
+)
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPalette, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
@@ -85,8 +88,13 @@ from PyQt6.QtWebEngineCore import (
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
-    QApplication, QCompleter, QFileDialog, QMainWindow, QMenu, QStackedWidget, QVBoxLayout, QHBoxLayout, QWidget,
+    QApplication, QCompleter, QFileDialog, QMainWindow, QMenu, QVBoxLayout, QHBoxLayout, QWidget,
 )
+
+try:
+    from PyQt6.QtWebEngineCore import QWebEngineContextMenuRequest
+except ImportError:          # older Qt: the page menu then simply offers fewer items
+    QWebEngineContextMenuRequest = None
 from PyQt6.QtCore import QStringListModel
 
 import shield_update
@@ -102,7 +110,7 @@ from shield_pages import Ctx, SchemeHandler, _list_line, _summary_line
 from shield_scripts import VAULT_JS, YT_JS, fill_call, fp_script, is_youtube_host
 from shield_scan import ScanEngine, VirusTotal, VTError, label_for_name, sha256_file
 from shield_ui import (
-    Chrome, FindBar, IconButton, Omnibox, Pill, Sheet, T, TabStrip, pix, soften_menu, stylesheet,
+    Chrome, FindBar, IconButton, Omnibox, Pill, Sheet, T, TabCard, TabSearch, TabStrip, ViewHost, pix, soften_menu, stylesheet,
 )
 
 
@@ -160,7 +168,7 @@ class _SessionLock(QAbstractNativeEventFilter):
 
 
 def watch_session_lock(win):
-    """Ask Windows to tell this window when the session is locked, and lock the vault when it does."""
+    """Ask Windows to tell this window when the session is locked; the vault locks when it is. One filter serves every window."""
     if os.name != "nt":
         return None
     try:
@@ -170,9 +178,11 @@ def watch_session_lock(win):
         fn.argtypes = [wintypes.HWND, wintypes.DWORD]
         fn.restype = wintypes.BOOL
         fn(int(win.winId()), 0)             # 0 = this session only
-        flt = _SessionLock(win.lock_vault_now)
-        QApplication.instance().installNativeEventFilter(flt)
-        return flt
+        app = QApplication.instance()
+        if getattr(app, "_session_lock", None) is None:
+            app._session_lock = _SessionLock(win.core.lock_vault_now)
+            app.installNativeEventFilter(app._session_lock)
+        return app._session_lock
     except Exception:
         return None
 
@@ -180,18 +190,18 @@ def watch_session_lock(win):
 class SafePage(QWebEnginePage):
     def __init__(self, browser, parent):
         super().__init__(browser.profile, parent)
-        self.b = browser
+        self.b = browser            # the window showing this page; a tab moved to another window gets a new one
         self._last_popup = 0.0
         self.starts = 0            # navigations begun on this page
         self.login = {}            # what the password-form script last reported
         self.pending = None        # a login that was just submitted and may be worth saving
-        self.fullScreenRequested.connect(browser.on_fullscreen)
+        self.fullScreenRequested.connect(lambda req: self.b.on_fullscreen(req, self))
         self.certificateError.connect(self._cert_error)
         self.loadFinished.connect(self._after_load)
         self.loadStarted.connect(self._on_start)
-        self.windowCloseRequested.connect(lambda: browser.close_page(self))
-        self.recentlyAudibleChanged.connect(lambda _a: browser.on_audio(self))
-        self.pdfPrintingFinished.connect(lambda path, ok: browser.toast("Saved the page as a PDF" if ok else "Couldn't save the PDF"))
+        self.windowCloseRequested.connect(lambda: self.b.close_page(self))
+        self.recentlyAudibleChanged.connect(lambda _a: self.b.on_audio(self))
+        self.pdfPrintingFinished.connect(lambda path, ok: self.b.toast("Saved the page as a PDF" if ok else "Couldn't save the PDF"))
         if hasattr(self, "permissionRequested"):
             self.permissionRequested.connect(self._perm_new)
         else:
@@ -342,6 +352,13 @@ class Tab(QWebEngineView):
         self.setPage(SafePage(browser, self))
         self.loading = False
 
+    def contextMenuEvent(self, e):
+        try:
+            self.page().b.page_menu(self, e.globalPos())
+        except RuntimeError:
+            pass
+
+
 
 def ext_kind(name):
     """Best guess at what a file is from its name alone (used until the real scan has looked at it)."""
@@ -394,11 +411,16 @@ class Root(QWidget):
         self.resized.emit()
 
 
-class Browser(QMainWindow):
-    def __init__(self, urls=()):
+class Core(QObject):
+    """Everything the windows share: settings, the web engine profile, the password vault, downloads, scanning,
+    protection lists and updates. There is exactly one, and it outlives every window."""
+
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("Shield")
-        self.resize(1320, 840)
+        self.windows = []          # the open Browser windows, oldest first
+        self._last = None          # the window that was active most recently
+        self._quitting = False
+        self._down = False
         self.cfg = Settings()
         self.events = Events()
         self.store = Store()
@@ -412,8 +434,6 @@ class Browser(QMainWindow):
         self.active_dl = {}
         self.session_perms = {}
         self.closed_tabs = []
-        self._devtools = []
-        self._printer = None
         self._session_sig = ""
         self._tick_n = 0
         # protection lists, password vault, updates
@@ -430,14 +450,11 @@ class Browser(QMainWindow):
         self.bridge.vt_done.connect(self._on_vt_done)
         self.bridge.say.connect(self.toast)
         self.bridge.show_folder.connect(lambda p: QDesktopServices.openUrl(QUrl.fromLocalFile(p)))
-        self.bridge.quit_now.connect(self.close)
+        self.bridge.quit_now.connect(self.quit_all)
         self.scan_live, self.vt_live, self.vt_cancel_ev, self.eng_jobs = {}, {}, {}, {}
         self._eng_cache, self._eng_ts = None, 0.0
-        self._sheet, self._sheet_q = None, []
         self.apply_theme()
         self._build_profile()
-        self._build_ui()
-        self._open_startup(urls)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(700)
@@ -449,15 +466,271 @@ class Browser(QMainWindow):
         self._lists_timer.start(30 * 60 * 1000)
         QTimer.singleShot(0, self._recover_downloads)
         self._start_server()
-        notes = list(STARTUP_WARNINGS) + (["The Chromium sandbox is off."] if sandbox_status() == "off" and not STARTUP_WARNINGS else [])
-        if notes:
-            QTimer.singleShot(1500, lambda: self.toast(notes[0]))
+        self.notes = list(STARTUP_WARNINGS) + (["The Chromium sandbox is off."] if sandbox_status() == "off" and not STARTUP_WARNINGS else [])
         try:
             QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self.cfg["theme"] == "system" and self.apply_theme())
         except Exception:
             pass
 
-    # ------------------------------------------------------------------ profile
+    # ------------------------------------------------------------------ windows
+    def active(self):
+        """The window the person is using (or last used)."""
+        w = QApplication.activeWindow()
+        if w is not None and any(w is x for x in self.windows):
+            return w
+        if self._last is not None and any(self._last is x for x in self.windows):
+            return self._last
+        return self.windows[-1] if self.windows else None
+
+    def _each(self, fn):
+        for w in list(self.windows):
+            try:
+                fn(w)
+            except RuntimeError:
+                pass
+
+    def toast(self, text):
+        w = self.active()
+        if w is not None:
+            w.toast(text)
+
+    def ask(self, on_done, **kw):
+        w = self.active()
+        if w is not None:
+            w.ask(on_done, **kw)
+
+    def _vault_ui(self):
+        self._each(lambda w: w._vault_ui())
+
+    def focus_active(self):
+        w = self.active()
+        if w is not None and w.cur() is not None:
+            w.cur().setFocus()
+
+    @staticmethod
+    def _fit(w):
+        """Nudge a window back onto a screen if it would hang off the edge."""
+        g = w.frameGeometry()
+        scr = QGuiApplication.screenAt(g.center()) or QGuiApplication.primaryScreen()
+        if scr is None:
+            return
+        a = scr.availableGeometry()
+        x = min(max(g.x(), a.left()), max(a.left(), a.right() - g.width() + 1))
+        y = min(max(g.y(), a.top()), max(a.top(), a.bottom() - g.height() + 1))
+        if (x, y) != (g.x(), g.y()):
+            w.move(x, y)
+
+    def new_window(self, urls=(), restore=None, empty=False, at=None, size=None):
+        """Open another browser window. `at` is where its frame goes; otherwise it cascades from the active window."""
+        src = self.active()
+        w = Browser(self, urls=urls, restore=restore, empty=empty)
+        self.windows.append(w)
+        roomy = src is not None and not src.isMaximized() and not src.isFullScreen()
+        geo = restore.get("geo") if restore else None
+        if size is not None:
+            w.resize(size)
+        elif geo and geo[2] >= 400 and geo[3] >= 300:
+            w.setGeometry(geo[0], geo[1], geo[2], geo[3])
+        elif roomy:
+            w.resize(src.size())
+        if at is not None:
+            w.move(at)
+        elif geo and geo[2] >= 400 and geo[3] >= 300:
+            pass
+        elif roomy:
+            w.move(src.pos() + QPoint(34, 34))
+        if restore and restore.get("max"):
+            w.showMaximized()
+        else:
+            w.show()
+        self._fit(w)
+        watch_session_lock(w)
+        self._last = w
+        return w
+
+    def tear_off(self, view, src, gp, grab):
+        """A tab was dropped on the desktop: it becomes its own window, with the tab under the pointer where it was held."""
+        state = src.release_view(view)
+        g, f = src.geometry(), src.frameGeometry()
+        frame = QPoint(g.x() - f.x(), g.y() - f.y())                                  # the title bar and border around the page area
+        client = QPoint(int(gp.x() - TabStrip.PAD_L - grab.x()), int(gp.y() - 5 - grab.y()))
+        size = src.normalGeometry().size() if src.isMaximized() else src.size()
+        w = self.new_window(empty=True, size=size, at=client - frame)
+        w.adopt_view(view, state)
+        self._fit(w)
+        w.bring_to_front()
+        if src.strip.count() == 0:
+            QTimer.singleShot(0, src.close)
+
+    def move_tab(self, view, src, dst, slot=None):
+        """Move a tab, page and all, from one window to another."""
+        if src is dst:
+            return
+        state = src.release_view(view)
+        dst.adopt_view(view, state, slot)
+        dst.bring_to_front()
+        if src.strip.count() == 0:
+            QTimer.singleShot(0, src.close)
+
+    def open_urls(self, urls):
+        w = self.active() or self.new_window()
+        for u in urls:
+            w.new_tab(QUrl(u))
+        w.bring_to_front()
+
+    def start(self, urls=()):
+        """Open the first window(s): last session if that is what the person chose, plus any addresses from the command line."""
+        saved = self._read_session() if self.cfg["startup"] == "restore" else []
+        made = [self.new_window(restore=s) for s in saved]
+        if urls:
+            if made:
+                for u in urls:
+                    made[-1].new_tab(QUrl(u))
+            else:
+                made.append(self.new_window(urls=urls))
+        elif not made:
+            made.append(self.new_window())
+        self._last = made[-1]
+        if self.notes:
+            QTimer.singleShot(1500, lambda: self.toast(self.notes[0]))
+
+    # ------------------------------------------------------------------ session
+    def _read_session(self):
+        try:
+            data = json.loads((HOME / "session.json").read_text("utf-8"))
+        except (OSError, ValueError):
+            return []
+        wins = data.get("windows") if isinstance(data, dict) else None
+        if not isinstance(wins, list):
+            wins = [data] if isinstance(data, dict) else []      # the older single-window format
+        out = []
+        for w in wins[:8]:
+            if not isinstance(w, dict):
+                continue
+            tabs = [t for t in w.get("tabs", []) if isinstance(t, dict) and re.match(r"^https?://", str(t.get("url", "")))][:60]
+            if not tabs:
+                continue
+            try:
+                cur = min(max(int(w.get("current", 0)), 0), len(tabs) - 1)
+            except (TypeError, ValueError):
+                cur = 0
+            geo = w.get("geo")
+            if not (isinstance(geo, list) and len(geo) == 4 and all(type(x) is int for x in geo)):
+                geo = None
+            out.append({"tabs": tabs, "current": cur, "geo": geo, "max": bool(w.get("max"))})
+        return out
+
+    def save_session(self, force=False):
+        if self.cfg["startup"] != "restore":
+            return
+        wins = [d for d in (w.session_state() for w in self.windows) if d]
+        data = json.dumps({"windows": wins})
+        if data == self._session_sig and not force:
+            return
+        self._session_sig = data
+        try:
+            (HOME / "session.json").write_text(data, encoding="utf-8")
+        except OSError:
+            pass
+
+    def _tick(self):
+        if self.vault.tick():
+            self.toast("Vault locked after a while without use")
+        self._tick_n += 1
+        if self._tick_n % 8 == 0:
+            self.save_session()
+
+    # ------------------------------------------------- one Shield, many windows
+    def _on_instance(self):
+        sock = self.server.nextPendingConnection()
+        if sock is None:
+            return
+        sock.waitForReadyRead(300)
+        raw = bytes(sock.readAll())[:65536]
+        sock.disconnectFromServer()
+        try:
+            urls = [u for u in json.loads(raw.decode("utf-8")) if isinstance(u, str) and re.match(r"^https?://\S+$", u)][:20]
+        except ValueError:
+            urls = []
+        if urls:
+            self.open_urls(urls)                 # a link from another app: a new tab in the window in use
+        else:
+            self.new_window().bring_to_front()   # starting Shield again opens another window
+
+    # ------------------------------------------------------------------ closing
+    def window_closing(self, win):
+        if not any(win is x for x in self.windows):
+            return
+        if not self._quitting and len(self.windows) == 1:
+            self.save_session(force=True)        # the last window still counts: this is what comes back next time
+        self.windows = [x for x in self.windows if x is not win]
+        if not self._quitting and self.windows:
+            self.save_session(force=True)
+        if not self.windows:
+            self.shutdown()
+
+    def quit_all(self):
+        if self._quitting:
+            return
+        self._quitting = True
+        self.save_session(force=True)
+        for w in list(self.windows):
+            w.close()
+        self.shutdown()
+        QApplication.quit()
+
+    def on_about_to_quit(self):
+        if self.windows and not self._quitting:
+            self.save_session(force=True)
+        self.shutdown()
+
+    def shutdown(self):
+        if self._down:
+            return
+        self._down = True
+        self.timer.stop()
+        self.vault.lock()
+        if self.cfg["clear_on_exit"] and self.cfg["persistent_sessions"]:
+            self.profile.cookieStore().deleteAllCookies()
+            self.profile.clearHttpCache()
+        for ev in self.vt_cancel_ev.values():
+            ev.set()
+
+    # ------------------------------------------------------------------ settings and data
+    def on_setting(self, key):
+        if key == "theme":
+            self.apply_theme()
+        elif key in ("fingerprint_protection", "fingerprint_level", "vault_autofill", "vault_offer_save"):
+            self.rebuild_scripts()
+            self._each(lambda w: w.refresh_vault_button())
+        elif key == "history_days":
+            self.store.prune_history(self.cfg["history_days"])
+        elif key == "vault_autolock":
+            self.vault.idle_minutes = self.cfg["vault_autolock"]
+        elif key == "startup" and self.cfg["startup"] == "home":
+            try:
+                (HOME / "session.json").unlink()
+            except OSError:
+                pass
+        elif key == "auto_update_lists":
+            self._lists_maybe_update()
+        elif key == "block_site_ads":
+            self.lists_changed()                  # rebuild with or without the ad lists
+        elif key == "check_updates" and self.cfg["check_updates"]:
+            threading.Thread(target=self._run_update_check, daemon=True).start()
+
+    def clear_data(self, what):
+        if what in ("history", "all"):
+            self.store.clear_history()
+            self.store.clear_favicons()
+            self._each(lambda w: w.refresh_completer())
+        if what in ("cookies", "all"):
+            self.profile.cookieStore().deleteAllCookies()
+        if what in ("cache", "all"):
+            self.profile.clearHttpCache()
+        if what in ("downloads", "all"):
+            self.store.clear_downloads()
+
     def _build_profile(self):
         if self.cfg["clear_on_exit"]:
             for d in ("profile", "cache"):           # wiped before the engine opens them: reliable even after a crash
@@ -534,165 +807,6 @@ class Browser(QMainWindow):
         self.profile.setHttpUserAgent(re.sub(r"\s*QtWebEngine/[\d.]+", "", self._default_ua) if fp else self._default_ua)
         self.profile.setHttpAcceptLanguage("en-US,en;q=0.9" if fp else "")
 
-    # --------------------------------------------------------------------- UI
-    def _build_ui(self):
-        self.root = Root()
-        self.setCentralWidget(self.root)
-        col = QVBoxLayout(self.root)
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(0)
-
-        self.chrome = Chrome()
-        cv = QVBoxLayout(self.chrome)
-        cv.setContentsMargins(0, 0, 0, 0)
-        cv.setSpacing(0)
-        self.strip = TabStrip()
-        self.strip.currentChanged.connect(self._select)
-        self.strip.closeRequested.connect(self.close_view)
-        self.strip.newRequested.connect(lambda: self.new_tab(QUrl(self.cfg["homepage"])))
-        self.strip.contextRequested.connect(self._tab_menu)
-        self.strip.audioToggleRequested.connect(self.toggle_mute)
-        cv.addWidget(self.strip)
-
-        bar = QWidget()
-        bar.setFixedHeight(48)
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(10, 0, 10, 8)
-        bl.setSpacing(2)
-        self.back_btn = IconButton("back", "Back (Alt+Left)")
-        self.fwd_btn = IconButton("forward", "Forward (Alt+Right)")
-        self.reload_btn = IconButton("reload", "Reload (F5)")
-        self.home_btn = IconButton("home", "Home")
-        self.back_btn.clicked.connect(lambda: self.cur().back())
-        self.fwd_btn.clicked.connect(lambda: self.cur().forward())
-        self.reload_btn.clicked.connect(self.reload_or_stop)
-        self.home_btn.clicked.connect(lambda: self.cur().setUrl(QUrl(self.cfg["homepage"])))
-        for b in (self.back_btn, self.fwd_btn, self.reload_btn, self.home_btn):
-            bl.addWidget(b)
-        bl.addSpacing(6)
-
-        self.omni = Omnibox()
-        self.urlbar = self.omni.edit
-        self.urlbar.returnPressed.connect(self.navigate)
-        self.omni.lock.clicked.connect(self.site_menu)
-        self.omni.star.clicked.connect(self.toggle_bookmark)
-        self.completer_model = QStringListModel(self)
-        self.completer = QCompleter(self.completer_model, self)
-        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
-        self.completer.activated.connect(lambda t: (self.urlbar.setText(t), self.navigate()))
-        self.urlbar.setCompleter(self.completer)
-        bl.addWidget(self.omni, 1)
-        bl.addSpacing(6)
-
-        self.shield_btn = IconButton("shield-check", "Blocked on this page. Click for the Security center.")
-        self.shield_btn.clicked.connect(lambda: self.open_internal("security"))
-        self.vault_btn = IconButton("key", "Passwords")
-        self.vault_btn.clicked.connect(self.key_menu)
-        self.dl_btn = IconButton("download", "Downloads (Ctrl+J)")
-        self.dl_btn.clicked.connect(lambda: self.open_internal("downloads"))
-        self.menu_btn = IconButton("more", "Menu")
-        self.menu_btn.clicked.connect(self.show_menu)
-        for b in (self.vault_btn, self.shield_btn, self.dl_btn, self.menu_btn):
-            bl.addWidget(b)
-        self.vault_btn.setVisible(self.cfg["vault_autofill"] or self.vault.exists())
-        cv.addWidget(bar)
-        col.addWidget(self.chrome)
-
-        self.stack = QStackedWidget()
-        col.addWidget(self.stack, 1)
-
-        self.toast_pill = Pill(self.root, hold_ms=2800)
-        self.link_pill = Pill(self.root, hold_ms=0, elide_frac=.62)
-        self.link_pill._anchor = "bottom-left"
-        self.findbar = FindBar(self.root)
-        self.findbar.queryChanged.connect(self._find_query)
-        self.findbar.step.connect(self._find_step)
-        self.findbar.closed.connect(lambda: self.cur() and self.cur().findText(""))
-        self.root.resized.connect(self._place_overlays)
-
-        self._build_menu()
-        extra = [
-            ("Ctrl+L", self.focus_urlbar), ("F6", self.focus_urlbar),
-            ("Ctrl+W", lambda: self.close_view(self.cur())),
-            ("F5", lambda: self.cur().reload()), ("Ctrl+R", lambda: self.cur().reload()),
-            ("Ctrl+Shift+R", lambda: self.cur().triggerPageAction(QWebEnginePage.WebAction.ReloadAndBypassCache)),
-            ("Alt+Left", lambda: self.cur().back()), ("Alt+Right", lambda: self.cur().forward()),
-            ("Ctrl+D", self.toggle_bookmark),
-            ("Ctrl+Tab", lambda: self.strip.cycle(+1)), ("Ctrl+Shift+Tab", lambda: self.strip.cycle(-1)),
-            ("Esc", self.hide_find), ("Ctrl++", lambda: self.zoom(+0.1)),
-            ("F12", self.open_devtools),
-        ] + [(f"Ctrl+{i}", lambda i=i: self.select_nth(i)) for i in range(1, 10)]
-        for key, fn in extra:
-            a = QAction(self)
-            a.setShortcut(QKeySequence(key))
-            a.triggered.connect(fn)
-            self.addAction(a)
-        self.refresh_completer()
-
-    def _build_menu(self):
-        self.menu = soften_menu(QMenu(self))
-        entries = [
-            ("New tab", "Ctrl+T", lambda: self.new_tab(QUrl(self.cfg["homepage"]))),
-            ("Reopen closed tab", "Ctrl+Shift+T", self.reopen_tab),
-            None,
-            ("Passwords", None, lambda: self.open_internal("passwords")),
-            ("Bookmarks", "Ctrl+Shift+O", lambda: self.open_internal("bookmarks")),
-            ("History", "Ctrl+H", lambda: self.open_internal("history")),
-            ("Downloads", "Ctrl+J", lambda: self.open_internal("downloads")),
-            None,
-            ("Find in page", "Ctrl+F", self.show_find),
-            ("Print\u2026", "Ctrl+P", self.print_page),
-            ("Save page as PDF\u2026", None, self.save_pdf),
-            ("View page source", "Ctrl+U", self.view_source),
-            ("Developer tools", "F12", None),
-            ("Zoom in", "Ctrl+=", lambda: self.zoom(+0.1)),
-            ("Zoom out", "Ctrl+-", lambda: self.zoom(-0.1)),
-            ("Actual size", "Ctrl+0", lambda: self.zoom(0)),
-            ("Full screen", "F11", self.toggle_fullscreen),
-            None,
-            ("Security center", None, lambda: self.open_internal("security")),
-            ("Clear browsing data\u2026", "Ctrl+Shift+Del", lambda: self.open_internal("settings#clear")),
-            ("Settings", "Ctrl+,", lambda: self.open_internal("settings")),
-            None,
-            ("Quit Shield", "Ctrl+Q", self.close),
-        ]
-        for item in entries:
-            if item is None:
-                self.menu.addSeparator()
-                continue
-            label, key, fn = item
-            a = self.menu.addAction(label + (f"\t{key}" if key else ""))
-            if fn is None:                     # shortcut already registered elsewhere (F12)
-                a.triggered.connect(self.open_devtools)
-                continue
-            a.triggered.connect(fn)
-            if key:
-                sc = QAction(self)
-                sc.setShortcut(QKeySequence(key))
-                sc.triggered.connect(fn)
-                self.addAction(sc)
-
-    def show_menu(self):
-        b = self.menu_btn
-        pos = b.mapToGlobal(b.rect().bottomRight())
-        pos.setX(pos.x() - self.menu.sizeHint().width())
-        pos.setY(pos.y() + 4)
-        self.menu.exec(pos)
-
-    def _place_overlays(self):
-        self.findbar.top = (self.chrome.height() if self.chrome.isVisible() else 0) + 10
-        for w in (self.toast_pill, self.link_pill, self.findbar):
-            w.reposition()
-        if self._sheet:
-            self._sheet.setGeometry(self.root.rect())
-
-    def focus_urlbar(self):
-        self.omni.focus_edit()
-
-    def toast(self, text):
-        self.toast_pill.show_text(text)
-
     def apply_theme(self):
         app = QApplication.instance()
         app.setStyle("Fusion")
@@ -726,375 +840,6 @@ class Browser(QMainWindow):
     def resolved_theme(self):
         return "dark" if self.is_dark() else "light"
 
-    # -------------------------------------------------------------------- tabs
-    def cur(self):
-        return self.stack.currentWidget()
-
-    def new_tab(self, url=None, background=False):
-        view = Tab(self)
-        self.stack.addWidget(view)
-        self.strip.add_tab(view, "New tab")
-        view.titleChanged.connect(lambda t, v=view: self._title(v, t))
-        view.iconChanged.connect(lambda ic, v=view: self._icon(v, ic))
-        view.urlChanged.connect(lambda u, v=view: self._sync() if v is self.cur() else None)
-        view.loadStarted.connect(lambda v=view: self._loading(v, True))
-        view.loadProgress.connect(lambda p, v=view: self.chrome.progress.progress(p) if v is self.cur() else None)
-        view.loadFinished.connect(lambda ok, v=view: self._load_done(v, ok))
-        view.page().linkHovered.connect(lambda u, v=view: self._hover_link(u) if v is self.cur() else None)
-        view.page().findTextFinished.connect(
-            lambda r, v=view: self.findbar.set_count(r.activeMatch(), r.numberOfMatches()) if v is self.cur() else None)
-        if not background:
-            self._select(view)
-        if url:
-            view.setUrl(url)
-        return view
-
-    def _select(self, view):
-        if view is None:
-            return
-        self.strip.set_current(view)
-        self.stack.setCurrentWidget(view)
-        self.chrome.progress.hide()
-        self._sync()
-        if self.findbar.isVisible():
-            self.cur().findText(self.findbar.edit.text())
-        view.setFocus()
-
-    def close_view(self, view):
-        if view is None:
-            return
-        if view.url().scheme() in ("http", "https"):
-            self.closed_tabs.append(view.url())
-        if self.strip.count() <= 1:
-            self.close()
-            return
-        views = self.strip.views()
-        i = views.index(view)
-        was_current = view is self.cur()
-        self.strip.remove_tab(view)
-        self.stack.removeWidget(view)
-        self._dispose(view)
-        if was_current:
-            rest = self.strip.views()
-            self._select(rest[min(i, len(rest) - 1)])
-
-    def close_page(self, page):
-        for v in self.strip.views():
-            if v.page() is page:
-                self.close_view(v)
-                return
-
-    def _tab_menu(self, view, pos):
-        m = soften_menu(QMenu(self))
-        m.addAction("Reload").triggered.connect(view.reload)
-        m.addAction("Duplicate").triggered.connect(lambda: self.new_tab(view.url()))
-        pinned = self.strip.is_pinned(view)
-        m.addAction("Unpin tab" if pinned else "Pin tab").triggered.connect(lambda: self.strip.set_pinned(view, not pinned))
-        if self.strip.audio_of(view) or view.page().isAudioMuted():
-            muted = view.page().isAudioMuted()
-            m.addAction("Unmute tab" if muted else "Mute tab").triggered.connect(lambda: self.toggle_mute(view))
-        m.addSeparator()
-        m.addAction("Close tab").triggered.connect(lambda: self.close_view(view))
-        views = self.strip.views()
-        right = [v for v in views[views.index(view) + 1:] if not self.strip.is_pinned(v)]
-        ar = m.addAction("Close tabs to the right")
-        ar.setEnabled(bool(right))
-        ar.triggered.connect(lambda: [self.close_view(v) for v in right])
-        other = m.addAction("Close other tabs")
-        keep = [v for v in views if v is not view and not self.strip.is_pinned(v)]
-        other.setEnabled(bool(keep))
-        other.triggered.connect(lambda: [self.close_view(v) for v in keep])
-        m.exec(pos)
-
-    def select_nth(self, n):
-        views = self.strip.views()
-        if views:
-            self._select(views[-1] if n >= 9 else views[min(n - 1, len(views) - 1)])
-
-    def on_audio(self, page):
-        for v in self.strip.views():
-            if v.page() is page:
-                self.strip.set_audio(v, 2 if page.isAudioMuted() else 1 if page.recentlyAudible() else 0)
-                return
-
-    def toggle_mute(self, view):
-        try:
-            p = view.page()
-            p.setAudioMuted(not p.isAudioMuted())
-            self.on_audio(p)
-        except RuntimeError:
-            pass
-
-    @staticmethod
-    def _dispose(view):
-        page = view.page()
-        view.setPage(None)
-        page.deleteLater()
-        view.deleteLater()
-
-    def reopen_tab(self):
-        if self.closed_tabs:
-            self.new_tab(self.closed_tabs.pop())
-
-    def open_internal(self, name):
-        self.new_tab(QUrl("shield://" + name))
-
-    def _title(self, view, title):
-        self.strip.set_title(view, title)
-        if view is self.cur():
-            self.setWindowTitle(f"{title} \u2013 Shield" if title else "Shield")
-
-    def _icon(self, view, icon):
-        self.strip.set_icon(view, icon)
-        u = view.url()
-        host = u.host().lower()
-        if u.scheme() in ("http", "https") and host and not icon.isNull() \
-                and (self.cfg["history_days"] or self.store.is_bookmarked(u.toString())):
-            ba = QByteArray()
-            buf = QBuffer(ba)
-            buf.open(QIODevice.OpenModeFlag.WriteOnly)
-            icon.pixmap(QSize(32, 32)).save(buf, "PNG")
-            self.store.save_favicon(host, bytes(ba))
-
-    def _loading(self, view, on):
-        view.loading = on
-        self.strip.set_loading(view, on)
-        if view is self.cur():
-            self.reload_btn.set_icon("close" if on else "reload")
-            if on:
-                self.chrome.progress.start()
-
-    def _load_done(self, view, ok):
-        self._loading(view, False)
-        if view is self.cur():
-            self.chrome.progress.finish()
-        u = view.url()
-        if ok and u.scheme() in ("http", "https") and self.cfg["history_days"]:
-            self.store.add_history(u.toString(), view.title())
-            self.refresh_completer()
-        if view is self.cur():
-            self._sync()
-
-    def reload_or_stop(self):
-        v = self.cur()
-        v.stop() if v.loading else v.reload()
-
-    def _sync(self):
-        v = self.cur()
-        if not v:
-            return
-        u = v.url()
-        s = u.scheme()
-        text = re.sub(r"^(shield://[^/?#]+)/(?=$|#)", r"\1", u.toString()) if s == "shield" else u.toString()
-        shown = "" if text in ("shield://newtab", "about:blank") else text
-        self.omni.set_url(shown)
-        look = {"https": ("lock", None, "Connection is secure"), "http": ("lock-open", "warn", "Connection is not secure"),
-                "shield": ("shield-check", "acc", "Shield page")}.get(s, ("globe", None, "Site controls"))
-        self.omni.lock.set_icon(look[0])
-        self.omni.lock.set_tone(look[1])
-        self.omni.lock.setToolTip(look[2] + ". Click for site controls.")
-        self.reload_btn.set_icon("close" if v.loading else "reload")
-        on = s in ("http", "https") and self.store.is_bookmarked(u.toString())
-        self.omni.star.set_icon("star-fill" if on else "star")
-        self.omni.star.set_tone("acc" if on else None)
-        h = v.history()
-        self.back_btn.setEnabled(h.canGoBack())
-        self.fwd_btn.setEnabled(h.canGoForward())
-        t = v.title()
-        self.setWindowTitle(f"{t} \u2013 Shield" if t else "Shield")
-
-    def _tick(self):
-        v = self.cur()
-        if v:
-            n = self.events.site_count(site_of(v.url().host()))
-            self.shield_btn.set_badge(f"{n}" if n else "", "ok")
-            self.shield_btn.set_tone("ok" if n else None)
-        n = self.store.pending_count()
-        self.dl_btn.set_badge(str(n) if n else "", "acc")
-        self.back_btn.setEnabled(bool(v) and v.history().canGoBack())
-        self.fwd_btn.setEnabled(bool(v) and v.history().canGoForward())
-        if self.vault.tick():
-            self.toast("Vault locked after a while without use")
-        self._tick_n += 1
-        if self._tick_n % 3 == 0:
-            self._vault_badge()
-        if self._tick_n % 8 == 0:
-            self._save_session()
-
-    def _hover_link(self, url):
-        if url:
-            self.link_pill.show_text(url, hold=False)
-        else:
-            self.link_pill.hide_now()
-
-    # --------------------------------------------------------------- navigation
-    def to_url(self, text):
-        t = text.strip()
-        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", t):
-            return QUrl(t)
-        if t.startswith("about:"):
-            return QUrl(t)
-        host = t.split("/")[0].split(":")[0]
-        if " " not in t and re.match(r"^[\w.-]+(:\d+)?(/.*)?$", t) and ("." in host or host == "localhost"):
-            return QUrl(("http://" if is_local_host(host) else "https://") + t)
-        tmpl = SEARCH_ENGINES[self.cfg["search_engine"]][1]
-        return QUrl(tmpl.format(quote_plus(t)))
-
-    def navigate(self):
-        if self.urlbar.text().strip():
-            self.cur().setUrl(self.to_url(self.urlbar.text()))
-            self.cur().setFocus()
-
-    def refresh_completer(self):
-        items = [b["url"] for b in self.store.bookmarks(100)]
-        items += [h["url"] for h in self.store.history("", 200)]
-        self.completer_model.setStringList(list(dict.fromkeys(items)))
-
-    def toggle_bookmark(self):
-        u = self.cur().url()
-        if u.scheme() in ("http", "https"):
-            on = self.store.toggle_bookmark(u.toString(), self.cur().title())
-            self.toast("Bookmark added" if on else "Bookmark removed")
-            self.refresh_completer()
-            self._sync()
-
-    def site_menu(self):
-        u = self.cur().url()
-        host = u.host().lower()
-        m = soften_menu(QMenu(self))
-        if u.scheme() not in ("http", "https") or not host:
-            m.addAction("Internal Shield page").setEnabled(False)
-        else:
-            m.addAction(host).setEnabled(False)
-            m.addAction("Secure connection (HTTPS)" if u.scheme() == "https" else "Not secure (HTTP)").setEnabled(False)
-            n = self.events.site_count(site_of(host))
-            m.addAction(f"{n:,} blocked on this site this session" if n else "Nothing blocked on this site yet").setEnabled(False)
-            m.addSeparator()
-            for rule, label in (("nojs", "Block JavaScript on this site"), ("http", "Allow plain HTTP on this site"),
-                                ("noblock", "Turn off ad and tracker blocking here")):
-                a = m.addAction(label)
-                a.setCheckable(True)
-                a.setChecked(rule in self.cfg["site_rules"].get(host, []))
-                a.toggled.connect(lambda on, r=rule: self.set_rule(host, r, on))
-        b = self.omni.lock
-        m.exec(b.mapToGlobal(b.rect().bottomLeft()))
-
-    def set_rule(self, host, rule, on):
-        self.cfg.add_rule(host, rule) if on else self.cfg.del_rule(host, rule)
-        self.cur().reload()
-
-    # ---------------------------------------------------------------- find/zoom
-    def show_find(self):
-        self._place_overlays()
-        self.findbar.present()
-
-    def hide_find(self):
-        if self.findbar.isVisible():
-            self.findbar.dismiss()
-
-    def _find_query(self, text):
-        if self.cur():
-            self.cur().findText(text)
-            if not text:
-                self.findbar.set_count(0, 0)
-
-    def _find_step(self, forward):
-        flag = QWebEnginePage.FindFlag(0) if forward else QWebEnginePage.FindFlag.FindBackward
-        self.cur().findText(self.findbar.edit.text(), flag)
-
-    def zoom(self, delta):
-        v = self.cur()
-        v.setZoomFactor(1.0 if delta == 0 else max(0.3, min(4.0, v.zoomFactor() + delta)))
-
-    def toggle_fullscreen(self):
-        self.showNormal() if self.isFullScreen() else self.showFullScreen()
-
-    def on_fullscreen(self, req):
-        req.accept()
-        on = req.toggleOn()
-        self.chrome.setVisible(not on)
-        self.showFullScreen() if on else self.showNormal()
-
-    # -------------------------------------------------------------------- sheets
-    def ask(self, on_done, **kw):
-        """Show a modal card without blocking the event loop. Cards queue up if several arrive at once."""
-        self._sheet_q.append((kw, on_done))
-        self._next_sheet()
-
-    def _next_sheet(self):
-        if self._sheet or not self._sheet_q:
-            return
-        kw, cb = self._sheet_q.pop(0)
-        s = Sheet(self.root, **kw)
-        self._sheet = s
-
-        def gone(*_):
-            self._sheet = None
-            QTimer.singleShot(0, self._next_sheet)
-        s.done.connect(cb)
-        s.destroyed.connect(gone)
-        s.present()
-
-    # -------------------------------------------------------------- permissions
-    def decide_permission(self, host, name, grant, deny, origin=None):
-        label = PERM_LABELS.get(name, name)
-        key = (origin or host, name)       # per origin (scheme, host and port), so http://x and https://x never share a grant
-        if key in self.session_perms:
-            (grant if self.session_perms[key] else deny)()
-            return
-        if self.cfg["permissions"] == "deny" or name == "Notifications":
-            deny()
-            self.events.add("permission", f"denied {label} for {host}")
-            return
-
-        def done(v):
-            ok = v == "allow"
-            self.session_perms[key] = ok
-            try:
-                (grant if ok else deny)()
-            except RuntimeError:
-                pass
-            self.events.add("permission", f"{'allowed' if ok else 'denied'} {label} for {host}")
-        self.ask(done, icon="shield", tone="acc", title=f"Allow {short(host, 36)} to use {label}?",
-                 body="If you allow it, this lasts until you close Shield.",
-                 buttons=[("Allow for this session", "pri", "allow"), ("Don't allow", "plain", "deny")], cancel="deny")
-
-    # ----------------------------------------------------------------- settings
-    def on_setting(self, key):
-        if key == "theme":
-            self.apply_theme()
-        elif key in ("fingerprint_protection", "fingerprint_level", "vault_autofill", "vault_offer_save"):
-            self.rebuild_scripts()
-            self.vault_btn.setVisible(self.cfg["vault_autofill"] or self.vault.exists())
-        elif key == "history_days":
-            self.store.prune_history(self.cfg["history_days"])
-        elif key == "vault_autolock":
-            self.vault.idle_minutes = self.cfg["vault_autolock"]
-        elif key == "startup" and self.cfg["startup"] == "home":
-            try:
-                (HOME / "session.json").unlink()
-            except OSError:
-                pass
-        elif key == "auto_update_lists":
-            self._lists_maybe_update()
-        elif key == "block_site_ads":
-            self.lists_changed()                  # rebuild with or without the ad lists
-        elif key == "check_updates" and self.cfg["check_updates"]:
-            threading.Thread(target=self._run_update_check, daemon=True).start()
-
-    def clear_data(self, what):
-        if what in ("history", "all"):
-            self.store.clear_history()
-            self.store.clear_favicons()
-            self.refresh_completer()
-        if what in ("cookies", "all"):
-            self.profile.cookieStore().deleteAllCookies()
-        if what in ("cache", "all"):
-            self.profile.clearHttpCache()
-        if what in ("downloads", "all"):
-            self.store.clear_downloads()
-
-    # ---------------------------------------------------------------- downloads
     def on_download(self, dl):
         name = clean_name(dl.downloadFileName())
         url = dl.url().toString()
@@ -1172,7 +917,6 @@ class Browser(QMainWindow):
                 else:
                     self.store.update_download(r["id"], state="failed")
 
-    # -- scanning (worker thread, results come back through the bridge) --------
     def _scan_async(self, did, path, name, url, mime):
         enabled = {k for k in ("yara", "clamav", "defender") if self.cfg.get(f"scan_{k}", True)}
         self.scan_live[did] = {"stage": "hash", "label": "Fingerprinting the file"}
@@ -1220,7 +964,6 @@ class Browser(QMainWindow):
         if "error" not in out and self.cfg["vt_auto_lookup"] and get_vt_key():
             self.vt_start(did, False)
 
-    # -- VirusTotal --------------------------------------------------------------
     def has_vt_key(self):
         return bool(get_vt_key())
 
@@ -1275,7 +1018,6 @@ class Browser(QMainWindow):
         elif res.get("state") == "needs_upload":
             self.toast("VirusTotal hasn't seen this file. Open Downloads to scan it.")
 
-    # -- scanner settings --------------------------------------------------------
     def _refresh_engines(self):
         try:
             self._eng_cache = self.scanner.engines_status()
@@ -1311,46 +1053,6 @@ class Browser(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
         return {"ok": True}
 
-    # ------------------------------------------------------------ startup, session
-    def _open_startup(self, urls=()):
-        """Open the first tabs: last session if the person chose that, any addresses from the command line, or home."""
-        opened = False
-        if self.cfg["startup"] == "restore":
-            try:
-                data = json.loads((HOME / "session.json").read_text("utf-8"))
-                saved = [t for t in data.get("tabs", []) if isinstance(t, dict) and re.match(r"^https?://", str(t.get("url", "")))][:60]
-                cur = min(max(int(data.get("current", 0)), 0), max(0, len(saved) - 1))
-                for i, t in enumerate(saved):
-                    v = self.new_tab(QUrl(t["url"]), background=i != cur)
-                    if t.get("pinned"):
-                        self.strip.set_pinned(v, True)
-                opened = bool(saved)
-            except (OSError, ValueError, TypeError):
-                pass
-        for u in urls:
-            self.new_tab(QUrl(u))
-            opened = True
-        if not opened:
-            self.new_tab(QUrl(self.cfg["homepage"]))
-
-    def _save_session(self, force=False):
-        if self.cfg["startup"] != "restore":
-            return
-        views = self.strip.views()
-        tabs = [{"url": v.url().toString(), "pinned": self.strip.is_pinned(v)} for v in views
-                if v.url().scheme() in ("http", "https")]
-        cur = self.cur()
-        idx = [i for i, v in enumerate([v for v in views if v.url().scheme() in ("http", "https")]) if v is cur]
-        data = json.dumps({"tabs": tabs, "current": idx[0] if idx else 0})
-        if data == self._session_sig and not force:
-            return
-        self._session_sig = data
-        try:
-            (HOME / "session.json").write_text(data, encoding="utf-8")
-        except OSError:
-            pass
-
-    # ----------------------------------------------- only one Shield at a time
     def _start_server(self):
         self.server = QLocalServer(self)
         name = instance_name()
@@ -1358,99 +1060,6 @@ class Browser(QMainWindow):
         self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         if self.server.listen(name):
             self.server.newConnection.connect(self._on_instance)
-
-    def _on_instance(self):
-        sock = self.server.nextPendingConnection()
-        if sock is None:
-            return
-        sock.waitForReadyRead(300)
-        raw = bytes(sock.readAll())[:65536]
-        sock.disconnectFromServer()
-        try:
-            urls = [u for u in json.loads(raw.decode("utf-8")) if isinstance(u, str) and re.match(r"^https?://\S+$", u)][:20]
-        except ValueError:
-            urls = []
-        for u in urls:
-            self.new_tab(QUrl(u))
-        if self.isMinimized():
-            self.showNormal()
-        self.raise_()
-        self.activateWindow()
-
-    # --------------------------------------------------- print, source, dev tools
-    def print_page(self):
-        v = self.cur()
-        if v.url().scheme() not in ("http", "https"):
-            self.toast("Only web pages can be printed")
-            return
-        self._printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        if not QPrintDialog(self._printer, self).exec():
-            self._printer = None
-            return
-
-        def done(ok):
-            self._printer = None
-            self.toast("Sent to the printer" if ok else "Couldn't print this page")
-        v.page().print(self._printer, done)
-
-    def save_pdf(self):
-        v = self.cur()
-        if v.url().scheme() not in ("http", "https"):
-            self.toast("Only web pages can be saved as PDF")
-            return
-        name = clean_name(v.title() or v.url().host() or "page")[:80] + ".pdf"
-        path, _ = QFileDialog.getSaveFileName(self, "Save page as PDF", str(DOWNLOADS / name), "PDF (*.pdf)")
-        if path:
-            v.page().printToPdf(path)
-
-    def view_source(self):
-        v = self.cur()
-        if v.url().scheme() in ("http", "https"):
-            self.new_tab(QUrl("view-source:" + v.url().toString()))
-
-    def open_devtools(self):
-        v = self.cur()
-        if not v or v.url().scheme() not in ("http", "https"):
-            self.toast("Developer tools open on web pages")
-            return
-        for dv in self._devtools[:]:
-            try:
-                if dv.property("target") is v.page() and dv.isVisible():
-                    dv.raise_()
-                    dv.activateWindow()
-                    return
-            except RuntimeError:
-                self._devtools.remove(dv)
-        dv = QWebEngineView()
-        dev_page = QWebEnginePage(self.profile, dv)
-        dv.setPage(dev_page)
-        dv.setProperty("target", v.page())
-        v.page().setDevToolsPage(dev_page)
-        dv.setWindowTitle("Developer tools \u2013 Shield")
-        dv.resize(1060, 720)
-        dv.show()
-        self._devtools.append(dv)
-
-    # ------------------------------------------------------------ password vault
-    def _vault_ui(self):
-        """Refresh everything that depends on the vault's state."""
-        self.vault_btn.setVisible(self.cfg["vault_autofill"] or self.vault.exists())
-        self._vault_badge()
-
-    def _vault_badge(self):
-        v, view = self.vault, self.cur()
-        if not view:
-            return
-        page = view.page()
-        origin = shield_vault.norm_origin(view.url().toString())
-        n = 0
-        if v.unlocked and origin and page.login.get("pw"):
-            n = len(v.for_origin(origin))
-        self.vault_btn.set_badge(str(n) if n else "", "acc")
-        self.vault_btn.set_tone("acc" if n else None)
-        tip = ("Passwords: set up the vault" if not v.exists() else "Passwords: the vault is locked. Click to unlock."
-               if not v.unlocked else f"{n} saved login{'s' if n != 1 else ''} for this site" if n else "Passwords")
-        self.vault_btn.setToolTip(tip)
 
     def lock_vault_now(self):
         if self.vault.unlocked:
@@ -1473,178 +1082,6 @@ class Browser(QMainWindow):
                 cb.clear()
         QTimer.singleShot(30000, wipe)
 
-    def unlock_prompt(self, after=None, error=""):
-        v = self.vault
-
-        def done(res):
-            act, text = res if isinstance(res, tuple) else (res, "")
-            if act != "unlock":
-                return
-            if v.wait_seconds():
-                self.toast(f"Too many tries. Wait {v.wait_seconds()} seconds.")
-                return
-            try:
-                ok = v.unlock(text)
-            except shield_vault.VaultError as e:
-                self.toast(str(e))
-                return
-            if ok:
-                self._vault_ui()
-                if after:
-                    after()
-            else:
-                self.unlock_prompt(after, "That isn't the master password. Try again.")
-        self.ask(done, icon="lock", tone="acc", title="Unlock your vault", body=error or "Enter your master password.",
-                 buttons=[("Unlock", "pri", "unlock"), ("Cancel", "plain", "cancel")], cancel="cancel",
-                 field={"placeholder": "Master password", "password": True})
-
-    def key_menu(self):
-        v, view = self.vault, self.cur()
-        m = soften_menu(QMenu(self))
-        origin = shield_vault.norm_origin(view.url().toString()) if view else ""
-        if not v.exists():
-            m.addAction("Set up the password vault\u2026").triggered.connect(lambda: self.open_internal("passwords"))
-        elif not v.unlocked:
-            m.addAction("Unlock the vault\u2026").triggered.connect(lambda: self.unlock_prompt())
-            m.addAction("Open passwords").triggered.connect(lambda: self.open_internal("passwords"))
-        else:
-            hits = v.for_origin(origin) if origin else []
-            if hits:
-                m.addAction(f"Fill a login for {shield_vault.host_of(origin)}").setEnabled(False)
-                for e in hits:
-                    m.addAction(e["username"] or "No username").triggered.connect(lambda _=False, i=e["id"]: self.vault_fill(i))
-            elif origin and not shield_vault.can_fill(origin):
-                m.addAction("Logins only fill on secure (HTTPS) pages").setEnabled(False)
-            elif origin:
-                m.addAction("No saved logins for this site").setEnabled(False)
-            m.addSeparator()
-            m.addAction("Generate a password and copy it").triggered.connect(self.gen_and_copy)
-            m.addAction("Open passwords").triggered.connect(lambda: self.open_internal("passwords"))
-            m.addAction("Lock the vault now").triggered.connect(lambda: (v.lock(), self._vault_ui(), self.toast("Vault locked")))
-        b = self.vault_btn
-        pos = b.mapToGlobal(b.rect().bottomRight())
-        pos.setX(pos.x() - m.sizeHint().width())
-        pos.setY(pos.y() + 4)
-        m.exec(pos)
-
-    def gen_and_copy(self):
-        self.copy_secret(shield_vault.generate(20))
-        self.toast("A new password is on your clipboard. It leaves in 30 seconds.")
-
-    def vault_fill(self, eid):
-        v, view = self.vault, self.cur()
-        try:
-            e = v.get(eid)
-        except shield_vault.VaultError:
-            return
-        if not e or not view:
-            return
-        if shield_vault.norm_origin(view.url().toString()) != e["origin"]:
-            self.toast("That login belongs to a different site")
-            return
-
-        def result(r):
-            msg = {"ok": "Filled", "noform": "There's no login form on this page",
-                   "cross": "This form would send your password to another site, so Shield didn't fill it",
-                   "hidden": "The password box on this page isn't visible, so Shield didn't fill it"}.get(r, "Couldn't fill this form")
-            if r == "ok":
-                try:
-                    v.mark_used(eid)
-                except shield_vault.VaultError:
-                    pass
-            self.toast(msg)
-        view.page().runJavaScript(fill_call(e["username"], e["password"]), APP_WORLD_ID, result)
-
-    # -- saving what was just typed
-    def vault_seen(self, page):
-        p = page.pending
-        if p and page.starts > p["starts"]:           # a new document loaded after the login was sent
-            page.pending = None
-            if not page.login.get("pw"):
-                self._offer_save(p["origin"], p["user"], p["pw"])
-        if page is self.cur().page():
-            self._vault_badge()
-
-    def vault_captured(self, page, d):
-        v = self.vault
-        if not (self.cfg["vault_offer_save"] and v.exists()):
-            return
-        origin = shield_vault.norm_origin(page.url().toString())
-        user, pw, kind = d.get("user", ""), d.get("pw", ""), d.get("kind")
-        if not origin or not shield_vault.can_fill(origin) or d.get("cross") or kind not in ("login", "new", "change") \
-                or not isinstance(user, str) or not isinstance(pw, str) or not pw:
-            return
-        if v.unlocked and shield_vault.host_of(origin) in v.never:
-            return
-        token = secrets.token_hex(4)
-        page.pending = {"origin": origin, "user": user[:256], "pw": pw[:256], "starts": page.starts, "token": token}
-        QTimer.singleShot(4000, lambda: self._pending_timeout(page, token))
-
-    def _pending_timeout(self, page, token):
-        try:
-            p = page.pending
-            if not p or p["token"] != token:
-                return
-            page.pending = None
-
-            def check(has_form):
-                if not has_form:                       # the form is gone: the sign-in worked
-                    self._offer_save(p["origin"], p["user"], p["pw"])
-            page.runJavaScript("(()=>!!document.querySelector('input[type=password]'))()", APP_WORLD_ID, check)
-        except RuntimeError:
-            pass
-
-    def _offer_save(self, origin, user, pw, error=""):
-        v = self.vault
-        host = shield_vault.host_of(origin)
-        who = f" for {short(user, 30)}" if user else ""
-        if v.unlocked:
-            state, _eid = v.known(origin, user, pw)
-            if state == "same" or host in v.never:
-                return
-
-            def done(a):
-                try:
-                    if a == "save":
-                        v.add(origin, user, pw)
-                        self.toast("Saved to your vault")
-                    elif a == "never":
-                        v.never_add(host)
-                        self.toast(f"Shield won't offer to save {short(host, 30)} again")
-                except shield_vault.VaultError as e:
-                    self.toast(str(e))
-                self._vault_ui()
-            update = state == "changed"
-            self.ask(done, icon="key", tone="acc", title="Update the saved password?" if update else "Save this password?",
-                     body=(f"The password{who} on {host} has changed." if update else f"Shield will keep this login{who} for {host} in your vault."),
-                     buttons=[("Update" if update else "Save", "pri", "save"), ("Not now", "plain", "skip"), ("Never for this site", "danger-text", "never")],
-                     cancel="skip")
-        else:
-            def done(res):
-                act, text = res if isinstance(res, tuple) else (res, "")
-                if act != "save":
-                    return
-                if v.wait_seconds():
-                    self.toast(f"Too many tries. Wait {v.wait_seconds()} seconds.")
-                    return
-                try:
-                    ok = v.unlock(text)
-                    if ok and host not in v.never and v.known(origin, user, pw)[0] != "same":
-                        v.add(origin, user, pw)
-                        self.toast("Saved to your vault")
-                except shield_vault.VaultError as e:
-                    self.toast(str(e))
-                    return
-                if ok:
-                    self._vault_ui()
-                else:
-                    self._offer_save(origin, user, pw, "That isn't the master password. Try again.")
-            self.ask(done, icon="key", tone="acc", title="Save this password?",
-                     body=error or f"Unlock your vault to save this login{who} for {host}.",
-                     buttons=[("Unlock and save", "pri", "save"), ("Not now", "plain", "skip")], cancel="skip",
-                     field={"placeholder": "Master password", "password": True})
-
-    # -- the API behind shield://passwords
     def vault_api(self, action, q):
         v = self.vault
         pw = q.get("pw", "")
@@ -1746,7 +1183,6 @@ class Browser(QMainWindow):
             return {"ok": False, "err": str(e)[:160] or "That didn't work"}
         return {"ok": False, "err": "unknown"}
 
-    # ------------------------------------------------ protection lists and threats
     def _build_protection(self):
         engine, threats = self.lists.build(skip_ids=() if self.cfg["block_site_ads"] else AD_LIST_IDS)
         self.prot.set(engine, threats)
@@ -1807,7 +1243,6 @@ class Browser(QMainWindow):
             summ = self.list_job["msg"] or "Working"
         return {"lists": rows, "summary": summ, "busy": self.list_job["busy"], "err": self.list_job["err"]}
 
-    # -------------------------------------------------------------------- updates
     @staticmethod
     def _engine_versions():
         base = "unknown"
@@ -1957,7 +1392,6 @@ class Browser(QMainWindow):
             return {"ok": True, "msg": "Downloading. Shield will restart by itself when it is ready."}
         return {"ok": True, "msg": "Downloading. Shield will tell you when it is saved."}
 
-    # -- the list shown on shield://downloads -----------------------------------
     def download_list(self):
         out = []
         for r in self.store.downloads(100):
@@ -2040,25 +1474,1133 @@ class Browser(QMainWindow):
         if row and row["path"]:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(row["path"]).parent)))
 
-    # -------------------------------------------------------------------- close
+
+class Browser(QMainWindow):
+    """One browser window. What it shares with the other windows lives in Core and is reached through self.core."""
+
+    def __init__(self, core, urls=(), restore=None, empty=False):
+        super().__init__()
+        self.core = core
+        self.setWindowTitle("Shield")
+        self.resize(1320, 840)
+        self.split_pair = None         # (left, right) while two tabs are shown side by side
+        self._devtools = []
+        self._printer = None
+        self._sheet, self._sheet_q = None, []
+        self._tick_n = 0
+        self._build_ui()
+        self._open_tabs(urls, restore, empty)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(700)
+        QApplication.instance().focusChanged.connect(self._focus_moved)
+
+    def __getattr__(self, name):
+        # Anything that is not about this window (settings, vault, store, profile ...) is looked up on the shared Core.
+        if name == "core" or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self.core, name)
+
+    def _open_tabs(self, urls, restore, empty):
+        opened = False
+        if restore:
+            saved, cur = restore["tabs"], restore["current"]
+            for i, t in enumerate(saved):
+                v = self.new_tab(QUrl(t["url"]), background=i != cur)
+                if t.get("pinned"):
+                    self.strip.set_pinned(v, True)
+            opened = bool(saved)
+        for u in urls:
+            self.new_tab(QUrl(u))
+            opened = True
+        if not opened and not empty:
+            self.new_tab(QUrl(self.cfg["homepage"]))
+
+    # ------------------------------------------------------------------ window
+    def new_window(self):
+        self.core.new_window()
+
+    def bring_to_front(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def changeEvent(self, e):
+        if e.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self.core._last = self
+        super().changeEvent(e)
+
+    def refresh_vault_button(self):
+        self.vault_btn.setVisible(self.cfg["vault_autofill"] or self.vault.exists())
+
+    def session_state(self):
+        views = [v for v in self.strip.views() if v.url().scheme() in ("http", "https")]
+        if not views:
+            return None
+        cur = self.cur()
+        idx = [i for i, v in enumerate(views) if v is cur]
+        g = self.normalGeometry() if (self.isMaximized() or self.isFullScreen()) else self.geometry()
+        return {"tabs": [{"url": v.url().toString(), "pinned": self.strip.is_pinned(v)} for v in views],
+                "current": idx[0] if idx else 0, "geo": [g.x(), g.y(), g.width(), g.height()], "max": self.isMaximized()}
+
+    # ------------------------------------------------- tabs that move between windows
+    def release_view(self, view):
+        """Take a tab out of this window without closing it, so that another window can adopt it."""
+        views = self.strip.views()
+        i = views.index(view)
+        was_current = view is self.cur()
+        mate = self.strip.mate_of(view)
+        if self.split_pair and any(view is x for x in self.split_pair):
+            self._end_split(show=mate)
+        state = self.strip.state_of(view)
+        self._unwire(view)
+        self.strip.remove_tab(view, ghost=False)
+        self.stack.removeWidget(view)
+        rest = self.strip.views()
+        if was_current and rest:
+            self._select(mate if mate is not None and any(mate is x for x in rest) else rest[min(i, len(rest) - 1)])
+        return state
+
+    def adopt_view(self, view, state, slot=None):
+        """Take over a tab (and its live page) from another window."""
+        self.stack.addWidget(view)
+        view.page().b = self
+        self.strip.insert_tab(view, state, slot)
+        self._wire(view)
+        self._select(view)
+
+    def _tab_dropped(self, view, target_strip, slot):
+        dst = target_strip.window()
+        if isinstance(dst, Browser) and dst is not self:
+            self.core.move_tab(view, self, dst, slot)
+
+    def move_to_new_window(self, view):
+        if self.strip.count() < 2:
+            return
+        o = self.mapToGlobal(QPoint(0, 0))
+        self.core.tear_off(view, self, QPoint(o.x() + 34 + TabStrip.PAD_L + 40, o.y() + 34 + 19), QPointF(40, 14))
+
+    # ------------------------------------------------------------------ split view
+    def split_clicked(self):
+        if self.split_pair:
+            self.split_menu()
+        else:
+            self.enter_split()
+
+    def split_toggle(self):
+        if self.split_pair:
+            self._end_split()
+        else:
+            self.enter_split()
+
+    def enter_split(self, other=None):
+        """Show the current tab next to another: the one given, or a fresh tab ready for an address."""
+        cur = self.cur()
+        if cur is None or self.split_pair or (other is not None and other is cur):
+            return
+        fresh = other is None
+        if fresh:
+            other = self.new_tab(QUrl(self.cfg["homepage"]), background=True)
+        self.strip.set_pair(cur, other)
+        self.split_pair = (cur, other)
+        self._select(other if fresh else cur)
+        self._refresh_split_ui()
+        if fresh:
+            QTimer.singleShot(0, self.focus_urlbar)
+
+    def _end_split(self, show=None):
+        """Put the two tabs back to being separate. Both stay open; `show` (default: the focused one) stays on screen."""
+        if not self.split_pair:
+            return
+        keep = show if show is not None else self.cur()
+        self.split_pair = None
+        self.strip.clear_pair()
+        if keep is not None:
+            self.stack.show_single(keep, animate=True)
+            self.strip.set_current(keep)
+            self._sync()
+        self._refresh_split_ui()
+
+    def swap_split(self):
+        if not self.split_pair:
+            return
+        a, b = self.split_pair
+        self.split_pair = (b, a)
+        self.strip.set_pair(b, a)
+        self.stack.swap()
+
+    def _refresh_split_ui(self):
+        on = self.split_pair is not None
+        self.split_btn.set_tone("acc" if on else None)
+        self.split_btn.setToolTip("Split view options" if on else "Split view (Ctrl+\\)")
+
+    def split_menu(self):
+        pair = self.split_pair
+        if not pair:
+            return
+        m = soften_menu(QMenu(self))
+        m.addAction("Swap sides").triggered.connect(lambda: self.swap_split())
+        m.addAction("Reset divider").triggered.connect(lambda: self.stack.set_ratio(0.5, animate=True))
+        m.addSeparator()
+        m.addAction("Close left pane").triggered.connect(lambda: self.close_view(pair[0]))
+        m.addAction("Close right pane").triggered.connect(lambda: self.close_view(pair[1]))
+        m.addAction("Move right pane to new window").triggered.connect(lambda: self.move_to_new_window(pair[1]))
+        m.addSeparator()
+        m.addAction("Exit split view\t" + "Ctrl+\\").triggered.connect(lambda: self._end_split())
+        b = self.split_btn
+        pos = b.mapToGlobal(b.rect().bottomRight())
+        pos.setX(pos.x() - m.sizeHint().width())
+        pos.setY(pos.y() + 4)
+        m.exec(pos)
+
+    def _focus_moved(self, _old, new):
+        try:
+            self.stack.note_focus(new)
+        except RuntimeError:
+            pass
+
+    def _open_in_split(self, url):
+        if self.split_pair:
+            cur = self.cur()
+            left, right = self.split_pair
+            (right if cur is left else left).setUrl(url)
+        else:
+            self.enter_split(self.new_tab(url, background=True))
+
+    # ------------------------------------------------------------------ hover card, tab search
+    @staticmethod
+    def _host_text(u):
+        s = u.scheme()
+        if s in ("http", "https"):
+            return u.host()
+        if s == "shield":
+            return "Shield"
+        return u.toString()[:80] if s else ""
+
+    def _hover_tab(self, view, rect):
+        if view is None or rect is None:
+            self.tabcard.dismiss()
+            return
+        st = self.strip.state_of(view)
+        chips = []
+        if st.get("audio") == 1:
+            chips.append(("Playing audio", "acc"))
+        elif st.get("audio") == 2:
+            chips.append(("Muted", None))
+        if st.get("pinned"):
+            chips.append(("Pinned", None))
+        if self.split_pair and any(view is x for x in self.split_pair):
+            chips.append(("Split view", "acc"))
+        if getattr(view, "loading", False):
+            chips.append(("Loading", None))
+        pt = self.strip.mapTo(self.root, QPoint(int(rect.center().x()), int(rect.bottom())))
+        self.tabcard.point_at(st.get("title") or view.title(), self._host_text(view.url()), chips, pt.x(), pt.y() + 6, self.root.width())
+
+    def show_tab_search(self):
+        self.tabcard.dismiss()
+        cur = self.cur()
+        rows = []
+        for v in self.strip.views():
+            st = self.strip.state_of(v)
+            rows.append({"kind": "tab", "view": v, "title": st.get("title") or v.title(), "host": self._host_text(v.url()),
+                         "icon": st.get("icon"), "current": v is cur})
+        for u in reversed(self.closed_tabs[-8:]):
+            rows.append({"kind": "closed", "url": u, "title": (u.host() + u.path()).rstrip("/") or u.toString(), "host": u.host(), "icon": None})
+        self.tabsearch.present(rows)
+
+    def _search_chosen(self, row):
+        if row["kind"] == "tab":
+            if any(row["view"] is x for x in self.strip.views()):
+                self._select(row["view"])
+        else:
+            if row["url"] in self.closed_tabs:
+                self.closed_tabs.remove(row["url"])
+            self.new_tab(row["url"])
+
+    # ------------------------------------------------------------------ page context menu
+    def page_menu(self, view, gpos):
+        if view is not self.cur():
+            self._select(view)
+        req = None
+        try:
+            req = view.lastContextMenuRequest()
+        except Exception:
+            pass
+        A = QWebEnginePage.WebAction
+        link = req.linkUrl() if req else QUrl()
+        media = req.mediaUrl() if req else QUrl()
+        sel = (req.selectedText() if req else "").strip()
+        editable = bool(req and req.isContentEditable())
+        is_img = False
+        if req and QWebEngineContextMenuRequest is not None and media.isValid():
+            is_img = req.mediaType() == QWebEngineContextMenuRequest.MediaType.MediaTypeImage
+        web_link = link.isValid() and link.scheme() in ("http", "https")      # a page can't use this menu to reach shield:// pages
+        m = soften_menu(QMenu(self))
+
+        def act(label, fn, enabled=True):
+            a = m.addAction(label)
+            a.setEnabled(enabled)
+            a.triggered.connect(lambda _=False: fn())
+            return a
+
+        def do(web_action):
+            return lambda: view.triggerPageAction(web_action)
+
+        if web_link:
+            act("Open link in new tab", lambda: self.new_tab(link))
+            act("Open link in new window", lambda: self.core.new_window(urls=[link.toString()]))
+            act("Open link in split view", lambda: self._open_in_split(link))
+            m.addSeparator()
+            act("Copy link address", do(A.CopyLinkToClipboard))
+            act("Save link as\u2026", do(A.DownloadLinkToDisk))
+            m.addSeparator()
+        if is_img:
+            if media.scheme() in ("http", "https"):
+                act("Open image in new tab", lambda: self.new_tab(media))
+            act("Copy image", do(A.CopyImageToClipboard))
+            act("Copy image address", do(A.CopyImageUrlToClipboard), media.scheme() in ("http", "https"))
+            act("Save image as\u2026", do(A.DownloadImageToDisk))
+            m.addSeparator()
+        if editable:
+            act("Cut", do(A.Cut), bool(sel))
+            act("Copy", do(A.Copy), bool(sel))
+            act("Paste", do(A.Paste))
+            act("Select all", do(A.SelectAll))
+            m.addSeparator()
+        elif sel:
+            act("Copy", do(A.Copy))
+            act("Search the web for \u201c" + short(sel.replace("\n", " "), 26) + "\u201d", lambda: self.new_tab(self.to_url(sel[:500])))
+            m.addSeparator()
+        elif not (web_link or is_img):
+            h = view.history()
+            act("Back", view.back, h.canGoBack())
+            act("Forward", view.forward, h.canGoForward())
+            act("Reload", view.reload)
+            m.addSeparator()
+            act("Select all", do(A.SelectAll))
+            act("Save as PDF\u2026", self.save_pdf)
+            act("Print\u2026", self.print_page)
+            m.addSeparator()
+        web_page = view.url().scheme() in ("http", "https")
+        act("View page source", self.view_source, web_page)
+        act("Inspect", self.open_devtools, web_page)
+        m.exec(gpos)
+
+    # ------------------------------------------------------------------ closing
     def closeEvent(self, e):
         self.timer.stop()
-        self._save_session(force=True)
-        self.vault.lock()
+        try:
+            QApplication.instance().focusChanged.disconnect(self._focus_moved)
+        except (TypeError, RuntimeError):
+            pass
+        self.tabcard.dismiss()
+        self.core.window_closing(self)
         for dv in self._devtools:
             try:
                 dv.close()
             except RuntimeError:
                 pass
-        if self.cfg["clear_on_exit"] and self.cfg["persistent_sessions"]:
-            self.profile.cookieStore().deleteAllCookies()
-            self.profile.clearHttpCache()
-        for ev in self.vt_cancel_ev.values():
-            ev.set()
         for v in list(self.strip.views()):
             self.stack.removeWidget(v)
             self._dispose(v)
         super().closeEvent(e)
+
+    # ------------------------------------------------------------------ the window's own UI
+    def _build_ui(self):
+        self.root = Root()
+        self.setCentralWidget(self.root)
+        col = QVBoxLayout(self.root)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        self.chrome = Chrome()
+        cv = QVBoxLayout(self.chrome)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+        self.strip = TabStrip()
+        self.strip.currentChanged.connect(self._select)
+        self.strip.closeRequested.connect(self.close_view)
+        self.strip.newRequested.connect(lambda: self.new_tab(QUrl(self.cfg["homepage"])))
+        self.strip.contextRequested.connect(self._tab_menu)
+        self.strip.audioToggleRequested.connect(self.toggle_mute)
+        self.strip.searchRequested.connect(self.show_tab_search)
+        self.strip.hoverChanged.connect(self._hover_tab)
+        self.strip.pairBroken.connect(lambda _v: self._end_split())
+        self.strip.tabDropped.connect(self._tab_dropped)
+        self.strip.tabTornOff.connect(lambda v, gp, grab: self.core.tear_off(v, self, gp, grab))
+        cv.addWidget(self.strip)
+
+        bar = QWidget()
+        bar.setFixedHeight(48)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(10, 0, 10, 8)
+        bl.setSpacing(2)
+        self.back_btn = IconButton("back", "Back (Alt+Left)")
+        self.fwd_btn = IconButton("forward", "Forward (Alt+Right)")
+        self.reload_btn = IconButton("reload", "Reload (F5)")
+        self.home_btn = IconButton("home", "Home")
+        self.back_btn.clicked.connect(lambda: self.cur().back())
+        self.fwd_btn.clicked.connect(lambda: self.cur().forward())
+        self.reload_btn.clicked.connect(self.reload_or_stop)
+        self.home_btn.clicked.connect(lambda: self.cur().setUrl(QUrl(self.cfg["homepage"])))
+        for b in (self.back_btn, self.fwd_btn, self.reload_btn, self.home_btn):
+            bl.addWidget(b)
+        bl.addSpacing(6)
+
+        self.omni = Omnibox()
+        self.urlbar = self.omni.edit
+        self.urlbar.returnPressed.connect(self.navigate)
+        self.omni.lock.clicked.connect(self.site_menu)
+        self.omni.star.clicked.connect(self.toggle_bookmark)
+        self.omni.zoom.clicked.connect(lambda: self.zoom(0))
+        self.completer_model = QStringListModel(self)
+        self.completer = QCompleter(self.completer_model, self)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.completer.activated.connect(lambda t: (self.urlbar.setText(t), self.navigate()))
+        self.urlbar.setCompleter(self.completer)
+        bl.addWidget(self.omni, 1)
+        bl.addSpacing(6)
+
+        self.shield_btn = IconButton("shield-check", "Blocked on this page. Click for the Security center.")
+        self.shield_btn.clicked.connect(lambda: self.open_internal("security"))
+        self.vault_btn = IconButton("key", "Passwords")
+        self.vault_btn.clicked.connect(self.key_menu)
+        self.dl_btn = IconButton("download", "Downloads (Ctrl+J)")
+        self.dl_btn.clicked.connect(lambda: self.open_internal("downloads"))
+        self.menu_btn = IconButton("more", "Menu")
+        self.menu_btn.clicked.connect(self.show_menu)
+        self.split_btn = IconButton("split", "Split view (Ctrl+\\)")
+        self.split_btn.clicked.connect(self.split_clicked)
+        for b in (self.vault_btn, self.shield_btn, self.dl_btn, self.split_btn, self.menu_btn):
+            bl.addWidget(b)
+        self.vault_btn.setVisible(self.cfg["vault_autofill"] or self.vault.exists())
+        cv.addWidget(bar)
+        col.addWidget(self.chrome)
+
+        self.stack = ViewHost()
+        self.stack.activated.connect(self._select)
+        col.addWidget(self.stack, 1)
+
+        self.toast_pill = Pill(self.root, hold_ms=2800)
+        self.link_pill = Pill(self.root, hold_ms=0, elide_frac=.62)
+        self.link_pill._anchor = "bottom-left"
+        self.findbar = FindBar(self.root)
+        self.findbar.queryChanged.connect(self._find_query)
+        self.findbar.step.connect(self._find_step)
+        self.findbar.closed.connect(lambda: self.cur() and self.cur().findText(""))
+        self.tabcard = TabCard(self.root)
+        self.tabsearch = TabSearch(self.root)
+        self.tabsearch.chosen.connect(self._search_chosen)
+        self.root.resized.connect(self._place_overlays)
+
+        self._build_menu()
+        extra = [
+            ("Ctrl+L", self.focus_urlbar), ("F6", self.focus_urlbar),
+            ("Ctrl+W", lambda: self.close_view(self.cur())),
+            ("F5", lambda: self.cur().reload()), ("Ctrl+R", lambda: self.cur().reload()),
+            ("Ctrl+Shift+R", lambda: self.cur().triggerPageAction(QWebEnginePage.WebAction.ReloadAndBypassCache)),
+            ("Alt+Left", lambda: self.cur().back()), ("Alt+Right", lambda: self.cur().forward()),
+            ("Ctrl+D", self.toggle_bookmark),
+            ("Ctrl+Tab", lambda: self.strip.cycle(+1)), ("Ctrl+Shift+Tab", lambda: self.strip.cycle(-1)),
+            ("Esc", self.hide_find), ("Ctrl++", lambda: self.zoom(+0.1)),
+            ("F12", self.open_devtools),
+        ] + [(f"Ctrl+{i}", lambda i=i: self.select_nth(i)) for i in range(1, 10)]
+        for key, fn in extra:
+            a = QAction(self)
+            a.setShortcut(QKeySequence(key))
+            a.triggered.connect(fn)
+            self.addAction(a)
+        self.refresh_completer()
+
+    def _build_menu(self):
+        self.menu = soften_menu(QMenu(self))
+        entries = [
+            ("New tab", "Ctrl+T", lambda: self.new_tab(QUrl(self.cfg["homepage"]))),
+            ("New window", "Ctrl+N", self.new_window),
+            ("Reopen closed tab", "Ctrl+Shift+T", self.reopen_tab),
+            ("Search tabs\u2026", "Ctrl+Shift+A", self.show_tab_search),
+            ("Split view", "Ctrl+\\", self.split_toggle),
+            None,
+            ("Passwords", None, lambda: self.open_internal("passwords")),
+            ("Bookmarks", "Ctrl+Shift+O", lambda: self.open_internal("bookmarks")),
+            ("History", "Ctrl+H", lambda: self.open_internal("history")),
+            ("Downloads", "Ctrl+J", lambda: self.open_internal("downloads")),
+            None,
+            ("Find in page", "Ctrl+F", self.show_find),
+            ("Print\u2026", "Ctrl+P", self.print_page),
+            ("Save page as PDF\u2026", None, self.save_pdf),
+            ("View page source", "Ctrl+U", self.view_source),
+            ("Developer tools", "F12", None),
+            ("Zoom in", "Ctrl+=", lambda: self.zoom(+0.1)),
+            ("Zoom out", "Ctrl+-", lambda: self.zoom(-0.1)),
+            ("Actual size", "Ctrl+0", lambda: self.zoom(0)),
+            ("Full screen", "F11", self.toggle_fullscreen),
+            None,
+            ("Security center", None, lambda: self.open_internal("security")),
+            ("Clear browsing data\u2026", "Ctrl+Shift+Del", lambda: self.open_internal("settings#clear")),
+            ("Settings", "Ctrl+,", lambda: self.open_internal("settings")),
+            None,
+            ("Close window", "Ctrl+Shift+W", self.close),
+            ("Quit Shield", "Ctrl+Q", self.core.quit_all),
+        ]
+        for item in entries:
+            if item is None:
+                self.menu.addSeparator()
+                continue
+            label, key, fn = item
+            a = self.menu.addAction(label + (f"\t{key}" if key else ""))
+            if fn is None:                     # shortcut already registered elsewhere (F12)
+                a.triggered.connect(self.open_devtools)
+                continue
+            a.triggered.connect(fn)
+            if key:
+                sc = QAction(self)
+                sc.setShortcut(QKeySequence(key))
+                sc.triggered.connect(fn)
+                self.addAction(sc)
+
+    def show_menu(self):
+        b = self.menu_btn
+        pos = b.mapToGlobal(b.rect().bottomRight())
+        pos.setX(pos.x() - self.menu.sizeHint().width())
+        pos.setY(pos.y() + 4)
+        self.menu.exec(pos)
+
+    def _place_overlays(self):
+        self.findbar.top = (self.chrome.height() if self.chrome.isVisible() else 0) + 10
+        for w in (self.toast_pill, self.link_pill, self.findbar):
+            w.reposition()
+        if self._sheet:
+            self._sheet.setGeometry(self.root.rect())
+        if self.tabsearch.isVisible():
+            self.tabsearch.setGeometry(self.root.rect())
+
+    def focus_urlbar(self):
+        self.omni.focus_edit()
+
+    def toast(self, text):
+        self.toast_pill.show_text(text)
+
+    def cur(self):
+        return self.stack.currentWidget()
+
+    def new_tab(self, url=None, background=False):
+        view = Tab(self)
+        self.stack.addWidget(view)
+        self.strip.add_tab(view, "New tab")
+        self._wire(view)
+        if not background:
+            self._select(view)
+        if url:
+            view.setUrl(url)
+        return view
+
+    def _wire(self, view):
+        """Connect a page's signals to this window. They are remembered so a tab can be handed to another window."""
+        page = view.page()
+        links = [
+            (view.titleChanged, lambda t, v=view: self._title(v, t)),
+            (view.iconChanged, lambda ic, v=view: self._icon(v, ic)),
+            (view.urlChanged, lambda u, v=view: self._sync() if v is self.cur() else None),
+            (view.loadStarted, lambda v=view: self._loading(v, True)),
+            (view.loadProgress, lambda p, v=view: self.chrome.progress.progress(p) if v is self.cur() else None),
+            (view.loadFinished, lambda ok, v=view: self._load_done(v, ok)),
+            (page.linkHovered, lambda u, v=view: self._hover_link(u) if v is self.cur() else None),
+            (page.findTextFinished,
+             lambda r, v=view: self.findbar.set_count(r.activeMatch(), r.numberOfMatches()) if v is self.cur() else None),
+        ]
+        for sig, slot in links:
+            sig.connect(slot)
+        view._links = links
+
+    def _unwire(self, view):
+        for sig, slot in getattr(view, "_links", []):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        view._links = []
+
+    def _select(self, view):
+        if view is None:
+            return
+        self.strip.set_current(view)
+        pair = self.split_pair
+        if pair and any(view is x for x in pair):
+            self.stack.show_split(pair[0], pair[1], view)
+        else:
+            self.stack.show_single(view)
+        self.chrome.progress.hide()
+        self._sync()
+        if self.findbar.isVisible():
+            self.cur().findText(self.findbar.edit.text())
+        view.setFocus()
+
+    def close_view(self, view):
+        if view is None:
+            return
+        if view.url().scheme() in ("http", "https"):
+            self.closed_tabs.append(view.url())
+        if self.strip.count() <= 1:
+            self.close()
+            return
+        views = self.strip.views()
+        i = views.index(view)
+        was_current = view is self.cur()
+        mate = self.strip.mate_of(view)
+        if self.split_pair and any(view is x for x in self.split_pair):
+            self._end_split(show=mate)           # the other half stays, and grows to fill the window
+        self.strip.remove_tab(view)
+        self.stack.removeWidget(view)
+        self._dispose(view)
+        if was_current:
+            rest = self.strip.views()
+            self._select(mate if mate is not None else rest[min(i, len(rest) - 1)])
+
+    def close_page(self, page):
+        for v in self.strip.views():
+            if v.page() is page:
+                self.close_view(v)
+                return
+
+    def _tab_menu(self, view, pos):
+        m = soften_menu(QMenu(self))
+        m.addAction("Reload").triggered.connect(view.reload)
+        m.addAction("Duplicate").triggered.connect(lambda: self.new_tab(view.url()))
+        pinned = self.strip.is_pinned(view)
+        m.addAction("Unpin tab" if pinned else "Pin tab").triggered.connect(lambda: self.strip.set_pinned(view, not pinned))
+        if self.strip.audio_of(view) or view.page().isAudioMuted():
+            muted = view.page().isAudioMuted()
+            m.addAction("Unmute tab" if muted else "Mute tab").triggered.connect(lambda: self.toggle_mute(view))
+        m.addSeparator()
+        cur, pair = self.cur(), self.split_pair
+        if pair and any(view is x for x in pair):
+            m.addAction("Exit split view").triggered.connect(lambda: self._end_split())
+        elif not pair and view is cur:
+            m.addAction("Open in split view").triggered.connect(lambda: self.enter_split())
+        elif not pair and cur is not None:
+            m.addAction("Show side by side with current tab").triggered.connect(lambda: self.enter_split(view))
+        others = [w for w in self.core.windows if w is not self]
+        if others:
+            sub = soften_menu(QMenu("Move to window", m))
+            for w in others:
+                label = short((w.windowTitle() or "Shield").replace(" \u2013 Shield", ""), 34) or "Shield"
+                sub.addAction(label).triggered.connect(lambda _=False, w=w: self.core.move_tab(view, self, w))
+            m.addMenu(sub)
+        if self.strip.count() > 1:
+            m.addAction("Move to new window").triggered.connect(lambda: self.move_to_new_window(view))
+        m.addSeparator()
+        m.addAction("Close tab").triggered.connect(lambda: self.close_view(view))
+        views = self.strip.views()
+        right = [v for v in views[views.index(view) + 1:] if not self.strip.is_pinned(v)]
+        ar = m.addAction("Close tabs to the right")
+        ar.setEnabled(bool(right))
+        ar.triggered.connect(lambda: [self.close_view(v) for v in right])
+        other = m.addAction("Close other tabs")
+        keep = [v for v in views if v is not view and not self.strip.is_pinned(v)]
+        other.setEnabled(bool(keep))
+        other.triggered.connect(lambda: [self.close_view(v) for v in keep])
+        m.exec(pos)
+
+    def select_nth(self, n):
+        views = self.strip.views()
+        if views:
+            self._select(views[-1] if n >= 9 else views[min(n - 1, len(views) - 1)])
+
+    def on_audio(self, page):
+        for v in self.strip.views():
+            if v.page() is page:
+                self.strip.set_audio(v, 2 if page.isAudioMuted() else 1 if page.recentlyAudible() else 0)
+                return
+
+    def toggle_mute(self, view):
+        try:
+            p = view.page()
+            p.setAudioMuted(not p.isAudioMuted())
+            self.on_audio(p)
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _dispose(view):
+        page = view.page()
+        view.setPage(None)
+        page.deleteLater()
+        view.deleteLater()
+
+    def reopen_tab(self):
+        if self.closed_tabs:
+            self.new_tab(self.closed_tabs.pop())
+
+    def open_internal(self, name):
+        self.new_tab(QUrl("shield://" + name))
+
+    def _title(self, view, title):
+        self.strip.set_title(view, title)
+        if view is self.cur():
+            self.setWindowTitle(f"{title} \u2013 Shield" if title else "Shield")
+
+    def _icon(self, view, icon):
+        self.strip.set_icon(view, icon)
+        u = view.url()
+        host = u.host().lower()
+        if u.scheme() in ("http", "https") and host and not icon.isNull() \
+                and (self.cfg["history_days"] or self.store.is_bookmarked(u.toString())):
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QIODevice.OpenModeFlag.WriteOnly)
+            icon.pixmap(QSize(32, 32)).save(buf, "PNG")
+            self.store.save_favicon(host, bytes(ba))
+
+    def _loading(self, view, on):
+        view.loading = on
+        self.strip.set_loading(view, on)
+        if view is self.cur():
+            self.reload_btn.set_icon("close" if on else "reload")
+            if on:
+                self.chrome.progress.start()
+
+    def _load_done(self, view, ok):
+        self._loading(view, False)
+        if view is self.cur():
+            self.chrome.progress.finish()
+        u = view.url()
+        if ok and u.scheme() in ("http", "https") and self.cfg["history_days"]:
+            self.store.add_history(u.toString(), view.title())
+            self.refresh_completer()
+        if view is self.cur():
+            self._sync()
+
+    def reload_or_stop(self):
+        v = self.cur()
+        v.stop() if v.loading else v.reload()
+
+    def _sync(self):
+        v = self.cur()
+        if not v:
+            return
+        u = v.url()
+        s = u.scheme()
+        text = re.sub(r"^(shield://[^/?#]+)/(?=$|#)", r"\1", u.toString()) if s == "shield" else u.toString()
+        shown = "" if text in ("shield://newtab", "about:blank") else text
+        self.omni.set_url(shown)
+        look = {"https": ("lock", None, "Connection is secure"), "http": ("lock-open", "warn", "Connection is not secure"),
+                "shield": ("shield-check", "acc", "Shield page")}.get(s, ("globe", None, "Site controls"))
+        self.omni.lock.set_icon(look[0])
+        self.omni.lock.set_tone(look[1])
+        self.omni.lock.setToolTip(look[2] + ". Click for site controls.")
+        self.reload_btn.set_icon("close" if v.loading else "reload")
+        on = s in ("http", "https") and self.store.is_bookmarked(u.toString())
+        self.omni.star.set_icon("star-fill" if on else "star")
+        self.omni.star.set_tone("acc" if on else None)
+        h = v.history()
+        self.back_btn.setEnabled(h.canGoBack())
+        self.fwd_btn.setEnabled(h.canGoForward())
+        self.omni.zoom.set_zoom(v.zoomFactor())
+        t = v.title()
+        self.setWindowTitle(f"{t} \u2013 Shield" if t else "Shield")
+
+    def _tick(self):
+        v = self.cur()
+        if v:
+            n = self.events.site_count(site_of(v.url().host()))
+            self.shield_btn.set_badge(f"{n}" if n else "", "ok")
+            self.shield_btn.set_tone("ok" if n else None)
+            self.omni.zoom.set_zoom(v.zoomFactor())
+        n = self.store.pending_count()
+        self.dl_btn.set_badge(str(n) if n else "", "acc")
+        self.back_btn.setEnabled(bool(v) and v.history().canGoBack())
+        self.fwd_btn.setEnabled(bool(v) and v.history().canGoForward())
+        self._tick_n += 1
+        if self._tick_n % 3 == 0:
+            self._vault_badge()
+
+    def _hover_link(self, url):
+        if url:
+            self.link_pill.show_text(url, hold=False)
+        else:
+            self.link_pill.hide_now()
+
+    def to_url(self, text):
+        t = text.strip()
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", t):
+            return QUrl(t)
+        if t.startswith("about:"):
+            return QUrl(t)
+        host = t.split("/")[0].split(":")[0]
+        if " " not in t and re.match(r"^[\w.-]+(:\d+)?(/.*)?$", t) and ("." in host or host == "localhost"):
+            return QUrl(("http://" if is_local_host(host) else "https://") + t)
+        tmpl = SEARCH_ENGINES[self.cfg["search_engine"]][1]
+        return QUrl(tmpl.format(quote_plus(t)))
+
+    def navigate(self):
+        if self.urlbar.text().strip():
+            self.cur().setUrl(self.to_url(self.urlbar.text()))
+            self.cur().setFocus()
+
+    def refresh_completer(self):
+        items = [b["url"] for b in self.store.bookmarks(100)]
+        items += [h["url"] for h in self.store.history("", 200)]
+        self.completer_model.setStringList(list(dict.fromkeys(items)))
+
+    def toggle_bookmark(self):
+        u = self.cur().url()
+        if u.scheme() in ("http", "https"):
+            on = self.store.toggle_bookmark(u.toString(), self.cur().title())
+            self.toast("Bookmark added" if on else "Bookmark removed")
+            self.refresh_completer()
+            self._sync()
+
+    def site_menu(self):
+        u = self.cur().url()
+        host = u.host().lower()
+        m = soften_menu(QMenu(self))
+        if u.scheme() not in ("http", "https") or not host:
+            m.addAction("Internal Shield page").setEnabled(False)
+        else:
+            m.addAction(host).setEnabled(False)
+            m.addAction("Secure connection (HTTPS)" if u.scheme() == "https" else "Not secure (HTTP)").setEnabled(False)
+            n = self.events.site_count(site_of(host))
+            m.addAction(f"{n:,} blocked on this site this session" if n else "Nothing blocked on this site yet").setEnabled(False)
+            m.addSeparator()
+            for rule, label in (("nojs", "Block JavaScript on this site"), ("http", "Allow plain HTTP on this site"),
+                                ("noblock", "Turn off ad and tracker blocking here")):
+                a = m.addAction(label)
+                a.setCheckable(True)
+                a.setChecked(rule in self.cfg["site_rules"].get(host, []))
+                a.toggled.connect(lambda on, r=rule: self.set_rule(host, r, on))
+        b = self.omni.lock
+        m.exec(b.mapToGlobal(b.rect().bottomLeft()))
+
+    def set_rule(self, host, rule, on):
+        self.cfg.add_rule(host, rule) if on else self.cfg.del_rule(host, rule)
+        self.cur().reload()
+
+    def show_find(self):
+        self._place_overlays()
+        self.findbar.present()
+
+    def hide_find(self):
+        if self.findbar.isVisible():
+            self.findbar.dismiss()
+
+    def _find_query(self, text):
+        if self.cur():
+            self.cur().findText(text)
+            if not text:
+                self.findbar.set_count(0, 0)
+
+    def _find_step(self, forward):
+        flag = QWebEnginePage.FindFlag(0) if forward else QWebEnginePage.FindFlag.FindBackward
+        self.cur().findText(self.findbar.edit.text(), flag)
+
+    def zoom(self, delta):
+        v = self.cur()
+        v.setZoomFactor(1.0 if delta == 0 else max(0.3, min(4.0, v.zoomFactor() + delta)))
+        self.omni.zoom.set_zoom(v.zoomFactor())
+
+    def toggle_fullscreen(self):
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+
+    def on_fullscreen(self, req, page=None):
+        req.accept()
+        on = req.toggleOn()
+        self.chrome.setVisible(not on)
+        self.showFullScreen() if on else self.showNormal()
+        if self.split_pair:
+            asker = next((x for x in self.strip.views() if page is not None and x.page() is page), None)
+            if on and asker is not None:
+                self.stack.show_single(asker)      # the page that asked fills the window; the split returns afterwards
+            elif not on:
+                self._select(self.cur())
+
+    def ask(self, on_done, **kw):
+        """Show a modal card without blocking the event loop. Cards queue up if several arrive at once."""
+        self._sheet_q.append((kw, on_done))
+        self._next_sheet()
+
+    def _next_sheet(self):
+        if self._sheet or not self._sheet_q:
+            return
+        kw, cb = self._sheet_q.pop(0)
+        s = Sheet(self.root, **kw)
+        self._sheet = s
+
+        def gone(*_):
+            self._sheet = None
+            QTimer.singleShot(0, self._next_sheet)
+        s.done.connect(cb)
+        s.destroyed.connect(gone)
+        s.present()
+
+    def decide_permission(self, host, name, grant, deny, origin=None):
+        label = PERM_LABELS.get(name, name)
+        key = (origin or host, name)       # per origin (scheme, host and port), so http://x and https://x never share a grant
+        if key in self.session_perms:
+            (grant if self.session_perms[key] else deny)()
+            return
+        if self.cfg["permissions"] == "deny" or name == "Notifications":
+            deny()
+            self.events.add("permission", f"denied {label} for {host}")
+            return
+
+        def done(v):
+            ok = v == "allow"
+            self.session_perms[key] = ok
+            try:
+                (grant if ok else deny)()
+            except RuntimeError:
+                pass
+            self.events.add("permission", f"{'allowed' if ok else 'denied'} {label} for {host}")
+        self.ask(done, icon="shield", tone="acc", title=f"Allow {short(host, 36)} to use {label}?",
+                 body="If you allow it, this lasts until you close Shield.",
+                 buttons=[("Allow for this session", "pri", "allow"), ("Don't allow", "plain", "deny")], cancel="deny")
+
+    def print_page(self):
+        v = self.cur()
+        if v.url().scheme() not in ("http", "https"):
+            self.toast("Only web pages can be printed")
+            return
+        self._printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        if not QPrintDialog(self._printer, self).exec():
+            self._printer = None
+            return
+
+        def done(ok):
+            self._printer = None
+            self.toast("Sent to the printer" if ok else "Couldn't print this page")
+        v.page().print(self._printer, done)
+
+    def save_pdf(self):
+        v = self.cur()
+        if v.url().scheme() not in ("http", "https"):
+            self.toast("Only web pages can be saved as PDF")
+            return
+        name = clean_name(v.title() or v.url().host() or "page")[:80] + ".pdf"
+        path, _ = QFileDialog.getSaveFileName(self, "Save page as PDF", str(DOWNLOADS / name), "PDF (*.pdf)")
+        if path:
+            v.page().printToPdf(path)
+
+    def view_source(self):
+        v = self.cur()
+        if v.url().scheme() in ("http", "https"):
+            self.new_tab(QUrl("view-source:" + v.url().toString()))
+
+    def open_devtools(self):
+        v = self.cur()
+        if not v or v.url().scheme() not in ("http", "https"):
+            self.toast("Developer tools open on web pages")
+            return
+        for dv in self._devtools[:]:
+            try:
+                if dv.property("target") is v.page() and dv.isVisible():
+                    dv.raise_()
+                    dv.activateWindow()
+                    return
+            except RuntimeError:
+                self._devtools.remove(dv)
+        dv = QWebEngineView()
+        dev_page = QWebEnginePage(self.profile, dv)
+        dv.setPage(dev_page)
+        dv.setProperty("target", v.page())
+        v.page().setDevToolsPage(dev_page)
+        dv.setWindowTitle("Developer tools \u2013 Shield")
+        dv.resize(1060, 720)
+        dv.show()
+        self._devtools.append(dv)
+
+    def _vault_ui(self):
+        """Refresh everything that depends on the vault's state."""
+        self.vault_btn.setVisible(self.cfg["vault_autofill"] or self.vault.exists())
+        self._vault_badge()
+
+    def _vault_badge(self):
+        v, view = self.vault, self.cur()
+        if not view:
+            return
+        page = view.page()
+        origin = shield_vault.norm_origin(view.url().toString())
+        n = 0
+        if v.unlocked and origin and page.login.get("pw"):
+            n = len(v.for_origin(origin))
+        self.vault_btn.set_badge(str(n) if n else "", "acc")
+        self.vault_btn.set_tone("acc" if n else None)
+        tip = ("Passwords: set up the vault" if not v.exists() else "Passwords: the vault is locked. Click to unlock."
+               if not v.unlocked else f"{n} saved login{'s' if n != 1 else ''} for this site" if n else "Passwords")
+        self.vault_btn.setToolTip(tip)
+
+    def unlock_prompt(self, after=None, error=""):
+        v = self.vault
+
+        def done(res):
+            act, text = res if isinstance(res, tuple) else (res, "")
+            if act != "unlock":
+                return
+            if v.wait_seconds():
+                self.toast(f"Too many tries. Wait {v.wait_seconds()} seconds.")
+                return
+            try:
+                ok = v.unlock(text)
+            except shield_vault.VaultError as e:
+                self.toast(str(e))
+                return
+            if ok:
+                self._vault_ui()
+                if after:
+                    after()
+            else:
+                self.unlock_prompt(after, "That isn't the master password. Try again.")
+        self.ask(done, icon="lock", tone="acc", title="Unlock your vault", body=error or "Enter your master password.",
+                 buttons=[("Unlock", "pri", "unlock"), ("Cancel", "plain", "cancel")], cancel="cancel",
+                 field={"placeholder": "Master password", "password": True})
+
+    def key_menu(self):
+        v, view = self.vault, self.cur()
+        m = soften_menu(QMenu(self))
+        origin = shield_vault.norm_origin(view.url().toString()) if view else ""
+        if not v.exists():
+            m.addAction("Set up the password vault\u2026").triggered.connect(lambda: self.open_internal("passwords"))
+        elif not v.unlocked:
+            m.addAction("Unlock the vault\u2026").triggered.connect(lambda: self.unlock_prompt())
+            m.addAction("Open passwords").triggered.connect(lambda: self.open_internal("passwords"))
+        else:
+            hits = v.for_origin(origin) if origin else []
+            if hits:
+                m.addAction(f"Fill a login for {shield_vault.host_of(origin)}").setEnabled(False)
+                for e in hits:
+                    m.addAction(e["username"] or "No username").triggered.connect(lambda _=False, i=e["id"]: self.vault_fill(i))
+            elif origin and not shield_vault.can_fill(origin):
+                m.addAction("Logins only fill on secure (HTTPS) pages").setEnabled(False)
+            elif origin:
+                m.addAction("No saved logins for this site").setEnabled(False)
+            m.addSeparator()
+            m.addAction("Generate a password and copy it").triggered.connect(self.gen_and_copy)
+            m.addAction("Open passwords").triggered.connect(lambda: self.open_internal("passwords"))
+            m.addAction("Lock the vault now").triggered.connect(lambda: (v.lock(), self._vault_ui(), self.toast("Vault locked")))
+        b = self.vault_btn
+        pos = b.mapToGlobal(b.rect().bottomRight())
+        pos.setX(pos.x() - m.sizeHint().width())
+        pos.setY(pos.y() + 4)
+        m.exec(pos)
+
+    def gen_and_copy(self):
+        self.copy_secret(shield_vault.generate(20))
+        self.toast("A new password is on your clipboard. It leaves in 30 seconds.")
+
+    def vault_fill(self, eid):
+        v, view = self.vault, self.cur()
+        try:
+            e = v.get(eid)
+        except shield_vault.VaultError:
+            return
+        if not e or not view:
+            return
+        if shield_vault.norm_origin(view.url().toString()) != e["origin"]:
+            self.toast("That login belongs to a different site")
+            return
+
+        def result(r):
+            msg = {"ok": "Filled", "noform": "There's no login form on this page",
+                   "cross": "This form would send your password to another site, so Shield didn't fill it",
+                   "hidden": "The password box on this page isn't visible, so Shield didn't fill it"}.get(r, "Couldn't fill this form")
+            if r == "ok":
+                try:
+                    v.mark_used(eid)
+                except shield_vault.VaultError:
+                    pass
+            self.toast(msg)
+        view.page().runJavaScript(fill_call(e["username"], e["password"]), APP_WORLD_ID, result)
+
+    def vault_seen(self, page):
+        p = page.pending
+        if p and page.starts > p["starts"]:           # a new document loaded after the login was sent
+            page.pending = None
+            if not page.login.get("pw"):
+                self._offer_save(p["origin"], p["user"], p["pw"])
+        cur = self.cur()
+        if cur is not None and page is cur.page():
+            self._vault_badge()
+
+    def vault_captured(self, page, d):
+        v = self.vault
+        if not (self.cfg["vault_offer_save"] and v.exists()):
+            return
+        origin = shield_vault.norm_origin(page.url().toString())
+        user, pw, kind = d.get("user", ""), d.get("pw", ""), d.get("kind")
+        if not origin or not shield_vault.can_fill(origin) or d.get("cross") or kind not in ("login", "new", "change") \
+                or not isinstance(user, str) or not isinstance(pw, str) or not pw:
+            return
+        if v.unlocked and shield_vault.host_of(origin) in v.never:
+            return
+        token = secrets.token_hex(4)
+        page.pending = {"origin": origin, "user": user[:256], "pw": pw[:256], "starts": page.starts, "token": token}
+        QTimer.singleShot(4000, lambda: self._pending_timeout(page, token))
+
+    def _pending_timeout(self, page, token):
+        try:
+            p = page.pending
+            if not p or p["token"] != token:
+                return
+            page.pending = None
+
+            def check(has_form):
+                if not has_form:                       # the form is gone: the sign-in worked
+                    self._offer_save(p["origin"], p["user"], p["pw"])
+            page.runJavaScript("(()=>!!document.querySelector('input[type=password]'))()", APP_WORLD_ID, check)
+        except RuntimeError:
+            pass
+
+    def _offer_save(self, origin, user, pw, error=""):
+        v = self.vault
+        host = shield_vault.host_of(origin)
+        who = f" for {short(user, 30)}" if user else ""
+        if v.unlocked:
+            state, _eid = v.known(origin, user, pw)
+            if state == "same" or host in v.never:
+                return
+
+            def done(a):
+                try:
+                    if a == "save":
+                        v.add(origin, user, pw)
+                        self.toast("Saved to your vault")
+                    elif a == "never":
+                        v.never_add(host)
+                        self.toast(f"Shield won't offer to save {short(host, 30)} again")
+                except shield_vault.VaultError as e:
+                    self.toast(str(e))
+                self._vault_ui()
+            update = state == "changed"
+            self.ask(done, icon="key", tone="acc", title="Update the saved password?" if update else "Save this password?",
+                     body=(f"The password{who} on {host} has changed." if update else f"Shield will keep this login{who} for {host} in your vault."),
+                     buttons=[("Update" if update else "Save", "pri", "save"), ("Not now", "plain", "skip"), ("Never for this site", "danger-text", "never")],
+                     cancel="skip")
+        else:
+            def done(res):
+                act, text = res if isinstance(res, tuple) else (res, "")
+                if act != "save":
+                    return
+                if v.wait_seconds():
+                    self.toast(f"Too many tries. Wait {v.wait_seconds()} seconds.")
+                    return
+                try:
+                    ok = v.unlock(text)
+                    if ok and host not in v.never and v.known(origin, user, pw)[0] != "same":
+                        v.add(origin, user, pw)
+                        self.toast("Saved to your vault")
+                except shield_vault.VaultError as e:
+                    self.toast(str(e))
+                    return
+                if ok:
+                    self._vault_ui()
+                else:
+                    self._offer_save(origin, user, pw, "That isn't the master password. Try again.")
+            self.ask(done, icon="key", tone="acc", title="Save this password?",
+                     body=error or f"Unlock your vault to save this login{who} for {host}.",
+                     buttons=[("Unlock and save", "pri", "save"), ("Not now", "plain", "skip")], cancel="skip",
+                     field={"placeholder": "Master password", "password": True})
 
 
 def app_icon():
@@ -2161,7 +2703,7 @@ def selftest(out_path):
 
     def engine_ok():
         """Reports the web engine's security-patch level, which is what the signed min_chromium floor is compared with."""
-        major = Browser._engine_major()
+        major = Core._engine_major()
         need(major > 0, "Qt could not report the engine's patch level")
         return f"Chromium security-patch major {major}"
 
@@ -2227,17 +2769,15 @@ def forward_to_running(urls):
 class _OpenEvents(QObject):
     """macOS hands 'open this link' to the running app as an event, not as a command-line argument."""
 
-    def __init__(self, win):
-        super().__init__(win)
-        self.win = win
+    def __init__(self, core):
+        super().__init__(core)
+        self.core = core
 
     def eventFilter(self, obj, ev):
         if ev.type() == QEvent.Type.FileOpen:
             u = ev.url().toString() if ev.url().isValid() else ""
             if re.match(r"^https?://\S+$", u):
-                self.win.new_tab(QUrl(u))
-                self.win.raise_()
-                self.win.activateWindow()
+                self.core.open_urls([u])
             return True
         return False
 
@@ -2272,13 +2812,14 @@ def main():
     f.setPointSizeF(9.5)
     app.setFont(f)
     app.setWindowIcon(app_icon())
-    win = Browser(urls)
+    core = Core()
+    app._core = core                                   # the one thing every window shares lives as long as the app
+    app.aboutToQuit.connect(core.on_about_to_quit)
     if sys.platform == "darwin":
-        app._open_events = _OpenEvents(win)
+        app._open_events = _OpenEvents(core)
         app.installEventFilter(app._open_events)
-    win.show()
-    app._session_lock = watch_session_lock(win)       # keeps the Windows lock-screen watcher alive (None elsewhere)
-    QTimer.singleShot(0, lambda: win.cur().setFocus())
+    core.start(urls)
+    QTimer.singleShot(0, core.focus_active)
     sys.exit(app.exec())
 
 

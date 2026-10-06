@@ -28,7 +28,7 @@ from shield_scan import (  # noqa: F401  (re-exported for the rest of the app)
     BENIGN_LOOKING, BIDI_CHARS, DOUBLE_EXT, EXEC_EXT, EXEC_MIMES, RISKY_EXT,
 )
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 HOME = Path(os.environ.get("SHIELD_HOME") or Path.home() / ".shieldbrowser")
 HOME.mkdir(parents=True, exist_ok=True)
 DOWNLOADS = Path(os.environ.get("SHIELD_DOWNLOADS") or Path.home() / "Downloads")
