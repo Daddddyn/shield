@@ -503,6 +503,18 @@ def _free_port():
         return s.getsockname()[1]
 
 
+def _tor_env(exe):
+    """Linux: Tor's libraries (libevent...) sit next to the tor program, and it does not look there by itself, so say where.
+    A packed Shield points LD_LIBRARY_PATH at its OWN libraries; Tor must not load those, so start from the original value."""
+    if not sys.platform.startswith("linux"):
+        return None
+    env = dict(os.environ)
+    orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    base = orig if orig is not None else ("" if getattr(sys, "frozen", False) else env.get("LD_LIBRARY_PATH", ""))
+    env["LD_LIBRARY_PATH"] = str(exe.parent) + (os.pathsep + base if base else "")
+    return env
+
+
 def _kill_with_us(proc):
     """Windows: put Tor in a job that dies with Shield, so it can never be left running if Shield crashes."""
     if os.name != "nt":
@@ -668,6 +680,9 @@ class TorRunner:
             kw = {}
             if os.name == "nt":
                 kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            env = _tor_env(exe)
+            if env is not None:
+                kw["env"] = env
             proc = subprocess.Popen([str(exe), "-f", str(torrc)], cwd=str(exe.parent), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                                     errors="replace", bufsize=1, **kw)

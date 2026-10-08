@@ -265,11 +265,16 @@ def install(dest, key=None):
     print(f"  {key}: {mb:.0f} MB copied to {dest}")
     # The bundle must actually run on this computer (catches the wrong CPU, a bad download, a missing library).
     try:
-        r = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=30, cwd=str(exe.parent))
+        env = dict(os.environ)
+        if key.startswith("linux"):          # same as Shield does when it starts Tor: its libraries are beside it
+            env["LD_LIBRARY_PATH"] = str(exe.parent) + (os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        r = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=30, cwd=str(exe.parent), env=env)
     except (OSError, subprocess.SubprocessError) as e:
         raise RuntimeError(f"The bundled {exe.name} would not start: {e}")
     if r.returncode != 0:
-        raise RuntimeError(f"The bundled {exe.name} --version failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[:300]}")
+        files = ", ".join(sorted(x.name for x in exe.parent.iterdir())[:40])
+        raise RuntimeError(f"The bundled {exe.name} --version failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[:300]}\n"
+                           f"  files next to it: {files}")
     print("  " + (r.stdout or "").splitlines()[0] if r.stdout else "  tor started")
     return dest
 
