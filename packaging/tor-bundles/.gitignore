@@ -1,0 +1,3 @@
+# The Tor downloads (tens of MB each, one per system) are fetched by tor_bundle.py, not stored in git.
+# The lock file next to this one IS committed: it records each download's SHA-256.
+*/

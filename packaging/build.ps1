@@ -62,12 +62,6 @@ if (-not (Test-Path "packaging\shield.ico")) {
     if ($LASTEXITCODE -ne 0) { Fail "Couldn't create the icon" }
 }
 
-# ---- Tor for this system --------------------------------------------------------------------------------------
-# Each installer carries only its own system's Tor (tor\tor_win here). get_tor.py fetches it, checked against packaging\tor_lock.json.
-Step "Tor (the private connection's program)"
-& $py packaging\get_tor.py
-if ($LASTEXITCODE -ne 0) { Fail "Couldn't get Tor. If packaging\tor_lock.json doesn't exist yet, run once:  python packaging\get_tor.py --update" }
-
 # ---- program folder -----------------------------------------------------------------------------------------
 Step "Packing the program (PyInstaller)"
 Remove-Item -Recurse -Force dist, build -ErrorAction SilentlyContinue
@@ -75,6 +69,11 @@ Remove-Item -Recurse -Force dist, build -ErrorAction SilentlyContinue
 if ($LASTEXITCODE -ne 0) { Fail "PyInstaller failed" }
 $exe = Join-Path $Root "dist\Shield\Shield.exe"
 if (-not (Test-Path $exe)) { Fail "dist\Shield\Shield.exe wasn't produced" }
+
+# ---- Tor: only this system's copy goes into the build (packaging\tor-bundles\windows-x64, fetched if missing) ----------
+Step "Adding Tor (windows-x64)"
+& $py packaging\tor_bundle.py install (Join-Path $Root "dist\Shield\tor")
+if ($LASTEXITCODE -ne 0) { Fail "Couldn't add Tor to the build (see above)" }
 $size = [math]::Round((Get-ChildItem dist\Shield -Recurse | Measure-Object Length -Sum).Sum / 1MB)
 Write-Host "Program folder: $size MB"
 

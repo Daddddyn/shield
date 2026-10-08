@@ -46,7 +46,6 @@ import asyncio
 import ipaddress
 import json
 import os
-import platform
 import re
 import secrets
 import socket
@@ -536,15 +535,6 @@ def _kill_with_us(proc):
         return None
 
 
-def tor_folder():
-    """Which folder of the bundled Tor programs belongs to THIS system. Each installer carries only its own; the others are never packed."""
-    m = platform.machine().lower()
-    arch = "arm64" if m in ("arm64", "aarch64") else "x64"
-    if sys.platform == "win32":
-        return "tor_win"
-    return f"tor_mac_{arch}" if sys.platform == "darwin" else f"tor_lin_{arch}"
-
-
 _BOOT = re.compile(r"Bootstrapped (\d+)%")
 
 
@@ -554,8 +544,9 @@ class TorRunner:
     def __init__(self, bases=None, home=None, on_ready=None, on_change=None):
         here = Path(__file__).resolve().parent
         frozen = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None
-        packed = Path(sys._MEIPASS) if getattr(sys, "_MEIPASS", None) else None      # where PyInstaller puts the data files it packs
-        self.bases = [Path(b) for b in (bases or [])] or [p for p in (packed, frozen, here) if p]
+        # macOS: the program sits in Shield.app/Contents/MacOS, the app's own files (the tor folder) in Contents/Resources.
+        mac_res = frozen.parent / "Resources" if (frozen is not None and sys.platform == "darwin") else None
+        self.bases = [Path(b) for b in (bases or [])] or [p for p in (frozen, mac_res, here) if p]
         self.home = Path(home) if home else Path(os.environ.get("SHIELD_HOME") or Path.home() / ".shieldbrowser")
         self.state, self.pct, self.message, self.socks_port = "idle", 0, "", 0
         self._on_ready, self._on_change = on_ready, on_change
@@ -570,7 +561,7 @@ class TorRunner:
         """The bundled tor program, or None. Only the Shield folder is searched; nothing from the environment or PATH."""
         name = "tor.exe" if os.name == "nt" else "tor"
         for b in self.bases:
-            for rel in (("tor", tor_folder(), "tor", name), ("tor", tor_folder(), name), ("tor", name), ("tor", "tor", name), ("tor", "Tor", name)):
+            for rel in (("tor", name), ("tor", "tor", name), ("tor", "Tor", name)):
                 p = b.joinpath(*rel)
                 if p.is_file():
                     return p
@@ -578,81 +569,6 @@ class TorRunner:
 
     def available(self):
         return self.find() is not None
-
-    def selftest(self):
-        """Run the bundled programs on this system and say whether they work: [(name, ok, detail)]. Needs no network.
-
-        1. tor itself starts (right CPU, its libraries are found, the system lets it run).
-        2. Tor accepts the configuration Shield writes for it: direct, and with each bridge type (paths, plugin lines, bridge lines).
-        3. each bridge program starts and speaks Tor's transport protocol, exactly as Tor will launch it."""
-        import tempfile
-        exe = self.find()
-        if exe is None:
-            return [("tor", False, "not found")]
-        kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
-        out = []
-        try:
-            r = subprocess.run([str(exe), "--version"], cwd=str(exe.parent), capture_output=True, text=True, timeout=30, **kw)
-            m = re.search(r"Tor version ([0-9][0-9.]*)", r.stdout)
-            out.append(("tor", r.returncode == 0 and bool(m), f"version {m.group(1)}" if m else (r.stderr or r.stdout or "did not start").strip()[:120]))
-        except (OSError, subprocess.SubprocessError) as e:
-            return [("tor", False, f"could not start: {e}"[:140])]
-        if not out[0][1]:
-            return out
-        info = self.transports()
-        with tempfile.TemporaryDirectory() as tmp:
-            probe = TorRunner(bases=self.bases, home=tmp)
-            methods = [("direct", [])] + [(n, sorted({v["plugin"]}) + ["UseBridges 1"] + [f"Bridge {b}" for b in v["bridges"]]) for n, v in sorted(info.items())]
-            for name, extra in methods:
-                probe._extra = extra
-                try:
-                    rc = probe._torrc(exe, _free_port())
-                    r = subprocess.run([str(exe), "--verify-config", "-f", str(rc)], cwd=str(exe.parent), capture_output=True, text=True, timeout=30, **kw)
-                    ok = r.returncode == 0
-                    why = "configuration accepted" if ok else ((r.stdout + r.stderr).strip().splitlines() or ["rejected"])[-1][:140]
-                except (OSError, subprocess.SubprocessError) as e:
-                    ok, why = False, str(e)[:140]
-                out.append((f"{name} config", ok, why))
-            for line in sorted({v["plugin"] for v in info.values()}):
-                out.append(self._probe_plugin(exe, line, tmp, kw))
-        return out
-
-    @staticmethod
-    def _probe_plugin(exe, line, tmp, kw):
-        """Start one bridge program the way Tor does and wait for it to announce its transport."""
-        import queue
-        parts = line.split()
-        names, prog, args = parts[1], parts[3], parts[4:]
-        env = dict(os.environ, TOR_PT_MANAGED_TRANSPORT_VER="1", TOR_PT_STATE_LOCATION=tmp, TOR_PT_CLIENT_TRANSPORTS=names,
-                   TOR_PT_EXIT_ON_STDIN_CLOSE="1")
-        label = Path(prog).stem
-        try:
-            proc = subprocess.Popen([str(exe.parent / prog), *args], cwd=str(exe.parent), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, **kw)
-        except OSError as e:
-            return (label, False, f"could not start: {e}"[:140])
-        q = queue.Queue()
-        threading.Thread(target=lambda: [q.put(x.strip()) for x in proc.stdout], daemon=True).start()
-        seen, end, ok = [], time.monotonic() + 15, False
-        try:
-            while time.monotonic() < end:
-                try:
-                    ln = q.get(timeout=0.3)
-                except queue.Empty:
-                    if proc.poll() is not None:
-                        break
-                    continue
-                seen.append(ln)
-                if ln.startswith("CMETHOD ") or "ENV-ERROR" in ln or "VERSION-ERROR" in ln:
-                    ok = ln.startswith("CMETHOD ")
-                    break
-        finally:
-            try:
-                proc.stdin.close()
-                proc.wait(3)
-            except Exception:
-                proc.kill()
-        return (label, ok, f"starts and offers {names}" if ok else ("; ".join(seen)[:140] or "gave no answer"))
 
     def pt(self):
         exe = self.find()
@@ -847,9 +763,6 @@ class PrivacyProxy:
 
     def available(self):
         return self.tor.available()
-
-    def selftest(self):
-        return self.tor.selftest()
 
     # -- which methods, in which order ---------------------------------------------
     def _file(self):

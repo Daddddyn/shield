@@ -1,133 +1,438 @@
 """
-shield_sound.py: optional interface sounds, chosen by the person.
+shield_sound.py: the sounds of Shield. Put your own audio files in the `sounds` folder and they play; nothing else to wire.
 
-Nothing ships with Shield. Drop your own files into the sounds folder (inside Shield's data folder, or next to the
-program) and turn "Sound effects" on in Settings:
+    sounds/click.wav            any button, and the fallback for the tab sounds below
+    sounds/tab_select.wav       switching to a tab                  (falls back to click)
+    sounds/tab_new.wav          opening a tab                       (falls back to tab_select, then click)
+    sounds/tab_close.wav        closing a tab                       (falls back to click)
+    sounds/toggle.wav           switches, the private connection    (falls back to click)
+    sounds/star.wav             bookmarking a page                  (falls back to click)
+    sounds/theme.wav            dark <-> light                      (falls back to toggle, then click)
+    sounds/sheet.wav            a dialog opening                    (silent if missing)
+    sounds/unlock.wav           the vault unlocking                 (falls back to success)
+    sounds/error.wav            a wrong password                    (silent if missing)
+    sounds/success.wav          something finished well             (silent if missing)
+    sounds/download.wav         a download landing                  (falls back to success)
+    sounds/connect.wav          private connection established      (falls back to success)
+    sounds/scroll.wav           ONE short tick, played every few lines you scroll
+    sounds/scroll_loop.wav      OR a continuous bed that swells with scroll speed (use either, or both)
 
-    click.wav   a left click anywhere in the browser
-    scroll.wav  played in small ticks while a page is scrolled (its own switch in Settings)
-    open.wav    a tab opening out of the tab bar
+  * Variations: name_1.wav, name_2.wav, ... are picked at random (never the same one twice in a row). A click that is a
+    little different each time is what keeps a sound from getting tiresome.
+  * Format: .wav plays instantly (QSoundEffect). .mp3, .ogg, .flac, .m4a and .opus work too but start a few tens of
+    milliseconds late, so use .wav for anything you click. Short is better: 30 to 150 ms for clicks and ticks.
+  * The sounds are PART OF THE APP, not a setting: there is no per-user folder and nothing a user can swap in. At build time
+    `python tools/pack_sounds.py` packs the files in `sounds/` into shield_sounds_data.py, which is imported like any other
+    module (so PyInstaller bundles it with no extra options). While developing, with no packed module, the plain `sounds`
+    folder beside shield.py is used instead.
+  * Settings > Fluid motion and sound has the master switch, the volume and a separate switch for the scroll sound.
 
-.wav plays with the lowest delay and is the best choice for clicks. .mp3, .ogg, .m4a and .flac also work. A name
-with no file is simply silent. Nothing is played, and no event filter is installed, while the setting is off.
+Scrolling is tied to REAL movement, not to the mouse wheel: the tick plays as the page actually moves, so it stays in step
+with smooth scrolling, trackpad momentum, keyboard and scrollbar dragging, stays quiet at the top and bottom of a page, and
+a page that scrolls itself never makes noise.
 
-The sounds are played by Qt's own audio classes: no extra package and nothing leaves the computer.
+No sound is played while Shield is in the background. If QtMultimedia is missing, everything here quietly does nothing.
 """
+import atexit
+import base64
+import math
+import random
+import re
+import shutil
+import tempfile
 import time
+import zlib
+from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QObject, QUrl, Qt
-from PyQt6.QtGui import QMouseEvent, QWheelEvent
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QObject, Qt, QUrl
+from PyQt6.QtGui import QGuiApplication
 
 try:
     from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QSoundEffect
-except Exception:                       # Qt built without multimedia: the setting stays, the sounds stay silent
-    QAudioOutput = QMediaPlayer = QSoundEffect = None
+    HAVE_AUDIO = True
+except Exception:                      # a build without multimedia: the browser must still work
+    HAVE_AUDIO = False
 
-EXTS = (".wav", ".mp3", ".ogg", ".m4a", ".flac")
-NAMES = ("click", "scroll", "open")
-SCROLL_STEP = 80.0         # pixels of scrolling between two ticks
-SCROLL_GAP = 0.045         # never closer together than this (seconds)
-CLICK_GAP = 0.03
+from shield_motion import FrameClock
+
+# What each event may fall back to, in order. An event nobody provided a file for is silent.
+EVENTS = {
+    "click": ("click",),
+    "tab_select": ("tab_select", "click"),
+    "tab_new": ("tab_new", "tab_select", "click"),
+    "tab_close": ("tab_close", "click"),
+    "toggle": ("toggle", "click"),
+    "star": ("star", "click"),
+    "theme": ("theme", "toggle", "click"),
+    "sheet": ("sheet",),
+    "unlock": ("unlock", "success"),
+    "error": ("error",),
+    "success": ("success",),
+    "download": ("download", "success"),
+    "connect": ("connect", "success"),
+    "scroll": ("scroll",),
+}
+_POOL = {"click": 4, "scroll": 5, "tab_select": 3}      # how many copies of a sound may overlap (default 2)
+_GAP = {"click": 0.030, "scroll": 0.030}                # the least time between two plays of one sound (seconds)
+_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac", ".opus"}
+_NAME = re.compile(r"^(.*?)(?:[_-]?\d+)?$")
 
 
-class _Voice:
-    """One sound with a few copies, so quick repeats overlap instead of cutting each other off."""
+def _unpack_embedded():
+    """The sounds packed into the app (shield_sounds_data.py), written to a private temporary folder that lives for this run
+    only and is deleted at exit. Returns that folder, or None when the app was built without packed sounds."""
+    try:
+        import shield_sounds_data as packed
+        files = packed.FILES
+    except Exception:
+        return None
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix="shield-snd-"))
+        for name, blob in files.items():
+            (tmp / Path(name).name).write_bytes(zlib.decompress(base64.b64decode(blob)))
+        atexit.register(shutil.rmtree, str(tmp), True)
+        return tmp
+    except Exception:
+        return None
 
-    def __init__(self, path, copies=3):
-        self.i = 0
-        self.items = []
+
+def sound_folders(app_dir):
+    """Where the sounds come from. The packed copy inside the app wins; the plain folder beside shield.py is only a
+    development fallback for when nothing has been packed. There is deliberately no user-writable location."""
+    tmp = _unpack_embedded()
+    if tmp is not None:
+        return [tmp]
+    return [Path(app_dir) / "sounds"]
+
+
+class _Sample:
+    """One audio file with a few players, so the same sound can overlap itself (fast clicking, fast scrolling)."""
+
+    def __init__(self, path, pool, parent):
+        self.path, self.voices, self.next = path, [], 0
+        self.effect = path.suffix.lower() == ".wav"
         url = QUrl.fromLocalFile(str(path))
-        self.wav = path.suffix.lower() == ".wav" and QSoundEffect is not None
-        for _ in range(copies):
-            if self.wav:
-                s = QSoundEffect()
-                s.setSource(url)
-                self.items.append(s)
-            elif QMediaPlayer is not None:
-                out = QAudioOutput()
-                pl = QMediaPlayer()
-                pl.setAudioOutput(out)
-                pl.setSource(url)
-                self.items.append((pl, out))
+        for _ in range(pool):
+            try:
+                if self.effect:
+                    v = QSoundEffect(parent)
+                    v.setSource(url)
+                else:
+                    v = QMediaPlayer(parent)
+                    v._out = QAudioOutput(parent)
+                    v.setAudioOutput(v._out)
+                    v.setSource(url)
+                self.voices.append(v)
+            except Exception:
+                break
+
+    def _busy(self, v):
+        try:
+            if self.effect:
+                return v.isPlaying()
+            return v.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        except Exception:
+            return True
 
     def play(self, volume):
-        if not self.items:
+        n = len(self.voices)
+        if not n:
             return
-        it = self.items[self.i]
-        self.i = (self.i + 1) % len(self.items)
-        if self.wav:
-            it.setVolume(volume)
-            it.play()
-        else:
-            pl, out = it
-            out.setVolume(volume)
-            pl.stop()
-            pl.setPosition(0)
-            pl.play()
+        pick = None
+        for i in range(n):
+            v = self.voices[(self.next + i) % n]
+            if not self._busy(v):
+                pick = v
+                break
+        if pick is None:                    # every copy is still sounding: cut in on the oldest
+            pick = self.voices[self.next % n]
+        self.next = (self.next + 1) % n
+        try:
+            if self.effect:
+                pick.setVolume(volume)
+                pick.play()
+            else:
+                pick._out.setVolume(volume)
+                pick.setPosition(0)
+                pick.play()
+        except Exception:
+            pass
 
 
-class Sounds(QObject):
-    def __init__(self, cfg, folders):
+class _Loop:
+    """A sound that repeats while it is wanted. Its volume is set from outside (the scroll bed follows scroll speed)."""
+
+    def __init__(self, path, parent):
+        self.v, self.on, self.effect = None, False, path.suffix.lower() == ".wav"
+        url = QUrl.fromLocalFile(str(path))
+        try:
+            if self.effect:
+                self.v = QSoundEffect(parent)
+                self.v.setSource(url)
+                try:
+                    self.v.setLoopCount(QSoundEffect.Loop.Infinite.value)
+                except Exception:
+                    self.v.setLoopCount(-2)
+                self.v.setVolume(0.0)
+            else:
+                self.v = QMediaPlayer(parent)
+                self.v._out = QAudioOutput(parent)
+                self.v.setAudioOutput(self.v._out)
+                self.v.setSource(url)
+                self.v.setLoops(QMediaPlayer.Loops.Infinite)
+                self.v._out.setVolume(0.0)
+        except Exception:
+            self.v = None
+
+    def volume(self, vol):
+        if self.v is None:
+            return
+        try:
+            (self.v.setVolume if self.effect else self.v._out.setVolume)(vol)
+        except Exception:
+            pass
+
+    def start(self):
+        if self.v is not None and not self.on:
+            self.on = True
+            try:
+                self.v.play()
+            except Exception:
+                pass
+
+    def stop(self):
+        if self.v is not None and self.on:
+            self.on = False
+            try:
+                self.v.stop()
+            except Exception:
+                pass
+
+
+class SoundEngine(QObject):
+    def __init__(self, folders):
         super().__init__()
-        self.cfg, self.folders = cfg, list(folders)
-        self.v = {}
-        self._on = False
-        self._t_click = self._t_scroll = 0.0
-        self._acc = 0.0
+        self.folders = [Path(f) for f in folders]
+        self.enabled, self.volume, self.scroll_on = True, 0.65, True
+        self._lib = {}          # name -> [_Sample, ...] (the variations)
+        self._last = {}         # name -> index of the variation played last
+        self._stamp = {}        # name -> when it last played
+        self.loop = None        # the scroll bed, if the person provided one
         self.reload()
 
+    # -- loading -------------------------------------------------------------------
     def reload(self):
-        """Look for the files again (so new ones are picked up without restarting)."""
-        self.v = {}
-        for name in NAMES:
-            found = next((d / (name + e) for d in self.folders for e in EXTS if (d / (name + e)).is_file()), None)
-            if found is not None:
-                try:
-                    self.v[name] = _Voice(found)
-                except Exception:
-                    pass
-
-    def apply(self):
-        """Install or remove the event filter to match the setting. Off means the app pays nothing for this."""
-        app = QApplication.instance()
-        if app is None:
+        """Find the files again. A name found in an earlier folder is not taken from a later one."""
+        self._lib.clear()
+        self.loop = None
+        if not HAVE_AUDIO:
             return
-        want = bool(self.cfg["sound_effects"])
-        if want and not self._on:
-            self.reload()
-            app.installEventFilter(self)
-            self._on = True
-        elif not want and self._on:
-            app.removeEventFilter(self)
-            self._on = False
+        claimed = {}
+        for folder in self.folders:
+            try:
+                files = sorted(f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in _EXTS)
+            except OSError:
+                continue
+            found = {}
+            for f in files:
+                name = _NAME.match(f.stem.lower()).group(1).strip("_-")
+                if name and name not in claimed:
+                    found.setdefault(name, []).append(f)
+            for name, paths in found.items():
+                claimed[name] = paths
+        for name, paths in claimed.items():
+            if name == "scroll_loop":
+                loop = _Loop(paths[0], self)
+                self.loop = loop if loop.v is not None else None
+                continue
+            samples = [_Sample(p, _POOL.get(name, 2), self) for p in paths]
+            samples = [s for s in samples if s.voices]
+            if samples:
+                self._lib[name] = samples
 
-    def play(self, name, gain=1.0):
-        if not self._on:
+    def configure(self, enabled=None, volume=None, scroll=None):
+        if enabled is not None:
+            self.enabled = bool(enabled)
+        if volume is not None:
+            self.volume = max(0.0, min(1.0, float(volume)))
+        if scroll is not None:
+            self.scroll_on = bool(scroll)
+        if not (self.enabled and self.scroll_on) and self.loop is not None:
+            self.loop.stop()
+
+    # -- playing ------------------------------------------------------------------
+    def _resolve(self, event):
+        for name in EVENTS.get(event, (event,)):
+            if name in self._lib:
+                return name
+        return None
+
+    def has(self, event):
+        return self._resolve(event) is not None
+
+    def play(self, event, gain=1.0):
+        """Play an event's sound. Returns True if one was started."""
+        if not (HAVE_AUDIO and self.enabled):
+            return False
+        if QGuiApplication.applicationState() != Qt.ApplicationState.ApplicationActive:
+            return False
+        name = self._resolve(event)
+        if name is None:
+            return False
+        now = time.perf_counter()
+        if now - self._stamp.get(name, 0.0) < _GAP.get(name, 0.045):
+            return False
+        self._stamp[name] = now
+        variants = self._lib[name]
+        i = 0
+        if len(variants) > 1:
+            choices = [k for k in range(len(variants)) if k != self._last.get(name)]
+            i = random.choice(choices)
+        self._last[name] = i
+        variants[i].play(max(0.0, min(1.0, self.volume * gain)))
+        return True
+
+
+class ScrollFeel(QObject):
+    """Turns scrolling into sound. Fed by the page itself (how far it REALLY moved), but only while a person is driving.
+
+    note_input() is called when the wheel, a scroll key or the mouse (button held) is used; for the next half second any
+    movement of the page counts as theirs. moved() is called with every change of the page's scroll position."""
+    STEP = 72.0          # pixels of travel per tick
+    INTENT = 0.5         # seconds a person's input keeps vouching for movement (covers smooth scrolling and trackpad glide)
+    FAST = 2600.0        # px/s that counts as "fast": ticks reach full volume
+    BED = 2200.0         # px/s at which the continuous bed reaches full volume
+
+    def __init__(self, engine):
+        super().__init__()
+        self.e = engine
+        self._until = 0.0
+        self._acc = 0.0
+        self._speed = 0.0
+        self._t_last = 0.0
+        self._bed, self._bed_goal, self._bed_run, self._last_move = 0.0, 0.0, False, 0.0
+        self._tick = self._bed_tick
+
+    def note_input(self):
+        self._until = time.perf_counter() + self.INTENT
+
+    def moved(self, dx, dy):
+        e = self.e
+        if not (e.enabled and e.scroll_on):
             return
-        v = self.v.get(name)
-        if v is not None:
-            v.play(max(0.0, min(1.0, self.cfg["sound_volume"] / 100.0 * gain)))
+        now = time.perf_counter()
+        if now > self._until:
+            self._acc, self._speed, self._t_last = 0.0, 0.0, 0.0      # the page moved by itself: not ours to announce
+            return
+        dist = abs(dx) + abs(dy)
+        if dist < 0.5:
+            return
+        dt = (now - self._t_last) if self._t_last and now - self._t_last < 0.25 else 0.016
+        self._t_last = now
+        self._speed += (dist / max(dt, 0.004) - self._speed) * 0.35
+        if e.has("scroll"):
+            self._acc += dist
+            n = 0
+            while self._acc >= self.STEP and n < 2:
+                e.play("scroll", 0.35 + 0.65 * min(1.0, self._speed / self.FAST))
+                self._acc -= self.STEP
+                n += 1
+            if self._acc >= self.STEP:
+                self._acc = 0.0
+        if e.loop is not None:
+            self._bed_goal = min(1.0, self._speed / self.BED)
+            self._last_move = now
+            if not self._bed_run:
+                self._bed_run = True
+                FrameClock.get().add(self._tick)
 
-    def eventFilter(self, obj, ev):
-        t = ev.type()
-        if t == QEvent.Type.MouseButtonPress:
-            if isinstance(ev, QMouseEvent) and ev.button() == Qt.MouseButton.LeftButton:
-                now = time.monotonic()
-                if now - self._t_click > CLICK_GAP:
-                    self._t_click = now
-                    self.play("click")
-        elif t == QEvent.Type.Wheel and self.cfg["sound_scroll"] and isinstance(ev, QWheelEvent):
-            pd, ad = ev.pixelDelta(), ev.angleDelta()
-            px = abs(pd.y()) or abs(ad.y()) * 100.0 / 120.0      # a wheel notch is about 100 px of page
-            if px:
-                now = time.monotonic()
-                if now - self._t_scroll > 0.25:
-                    self._acc = SCROLL_STEP                    # a fresh scroll ticks right away
-                self._acc += px
-                if self._acc >= SCROLL_STEP and now - self._t_scroll >= SCROLL_GAP:
-                    speed = min(1.0, px / 120.0)               # a fast flick is a little louder than a slow drag
-                    self._acc = 0.0
-                    self._t_scroll = now
-                    self.play("scroll", 0.55 + 0.45 * speed)
+    def _bed_tick(self, dt):
+        e = self.e
+        if time.perf_counter() - self._last_move > 0.14:
+            self._bed_goal = 0.0
+        self._bed += (self._bed_goal - self._bed) * (1.0 - math.exp(-16.0 * dt))
+        if e.loop is None or not (e.enabled and e.scroll_on):
+            self._bed, self._bed_run = 0.0, False
+            return False
+        if self._bed > 0.03:
+            e.loop.start()
+            e.loop.volume(min(1.0, self._bed * e.volume))
+            return True
+        if self._bed_goal <= 0.0:
+            e.loop.stop()
+            self._bed, self._bed_run = 0.0, False
+            return False
+        return True
+
+
+class ScrollWatcher(QObject):
+    """Sits on one web view. Notices a person scrolling (wheel, keys, dragging) and the page's real scroll movement."""
+    def __init__(self, view, feel):
+        super().__init__(view)
+        from PyQt6.QtCore import QEvent
+        self._ev = QEvent.Type
+        self.view, self.feel = view, feel
+        self._proxy = None
+        self._pos = None
+        self._keys = {Qt.Key.Key_Space, Qt.Key.Key_PageUp, Qt.Key.Key_PageDown, Qt.Key.Key_Home, Qt.Key.Key_End,
+                      Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Left, Qt.Key.Key_Right}
+        view.installEventFilter(self)
+        self.hook()
+        view.page().scrollPositionChanged.connect(self._moved)
+
+    def hook(self):
+        """The widget that really receives input can be replaced when the page changes process: follow it."""
+        try:
+            fp = self.view.focusProxy()
+        except RuntimeError:
+            return
+        if fp is not None and fp is not self._proxy:
+            self._proxy = fp
+            fp.installEventFilter(self)
+
+    def _moved(self, pos):
+        try:
+            if not self.view.isVisible():
+                self._pos = None
+                return
+        except RuntimeError:
+            return
+        if self._pos is not None:
+            self.feel.moved(pos.x() - self._pos.x(), pos.y() - self._pos.y())
+        self._pos = pos
+
+    def eventFilter(self, obj, e):
+        t = e.type()
+        E = self._ev
+        if t == E.Wheel:
+            self.feel.note_input()
+        elif t == E.KeyPress:
+            if e.key() in self._keys:
+                self.feel.note_input()
+        elif t == E.MouseMove:
+            if e.buttons() & Qt.MouseButton.LeftButton:       # dragging the scroll bar, or a selection that scrolls the page
+                self.feel.note_input()
+        elif t in (E.ChildAdded, E.ChildPolished):
+            self.hook()
         return False
+
+
+# --------------------------------------------------------------------------
+# The one shared engine. Widgets call play("click") without needing a reference to anything.
+# --------------------------------------------------------------------------
+_engine = None
+
+
+def install(engine):
+    global _engine
+    _engine = engine
+
+
+def play(event, gain=1.0):
+    e = _engine
+    if e is not None:
+        try:
+            return e.play(event, gain)
+        except Exception:
+            return False
+    return False

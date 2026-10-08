@@ -50,23 +50,13 @@ ICON_FILE = {"win32": "shield.ico", "darwin": "shield.icns"}.get(sys.platform)
 ICON = Path(SPECPATH) / ICON_FILE if ICON_FILE else None
 ICON = ICON if ICON and ICON.exists() else None
 
-# Tor. Each installer carries ONLY its own system's folder (tor/tor_win, tor/tor_mac_arm64, tor/tor_mac_x64, tor/tor_lin_x64,
-# tor/tor_lin_arm64), made by packaging/get_tor.py. They are packed as data, so they sit beside the program inside the install,
-# where shield_proxy.py looks (tor_folder() there must give the same name).
-import platform
-_cpu = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
-TOR_FOLDER = "tor_win" if IS_WIN else (f"tor_mac_{_cpu}" if IS_MAC else f"tor_lin_{_cpu}")
-TOR_SRC = ROOT / "tor" / TOR_FOLDER
-if not (TOR_SRC / "tor").is_dir():
-    raise SystemExit(f"{TOR_SRC} is missing. Run:  python packaging/get_tor.py   (build.ps1 / build.sh do it for you)")
-
 # Qt parts Shield never uses. Leaving them out makes the install smaller and the antivirus scan faster.
 # (QtQml / QtQuick / QtOpenGL / QtNetwork / QtPositioning / QtWebChannel stay: the web engine itself needs them.)
 UNUSED = [
     "PyQt6.QtBluetooth", "PyQt6.QtNfc", "PyQt6.QtSensors", "PyQt6.QtSerialPort", "PyQt6.QtSql", "PyQt6.QtTest",
     "PyQt6.QtDesigner", "PyQt6.QtHelp", "PyQt6.Qt3DCore", "PyQt6.Qt3DRender", "PyQt6.Qt3DInput", "PyQt6.Qt3DLogic",
     "PyQt6.Qt3DAnimation", "PyQt6.Qt3DExtras", "PyQt6.QtCharts", "PyQt6.QtDataVisualization", "PyQt6.QtGraphs",
-    "PyQt6.QtMultimediaWidgets", "PyQt6.QtRemoteObjects", "PyQt6.QtTextToSpeech",
+    "PyQt6.QtMultimedia", "PyQt6.QtMultimediaWidgets", "PyQt6.QtRemoteObjects", "PyQt6.QtTextToSpeech",
     "PyQt6.QtNetworkAuth", "PyQt6.QtStateMachine", "PyQt6.QtSpatialAudio", "PyQt6.QtQuick3D", "PyQt6.QtScxml",
     "PyQt6.QtVirtualKeyboard", "PyQt6.QtHttpServer", "PyQt6.QtLocation", "PyQt6.QtSvgWidgets", "PyQt6.QtPdfWidgets",
     "tkinter", "unittest", "pydoc", "doctest", "test", "setuptools", "pkg_resources", "distutils", "lib2to3",
@@ -76,9 +66,9 @@ a = Analysis(
     [str(ROOT / "shield.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[(str(TOR_SRC), f"tor/{TOR_FOLDER}")],
+    datas=[],
     # Both are imported inside try/except in shield_scan.py. Naming them here guarantees they are packed.
-    hiddenimports=["yara_x", "pefile", "PyQt6.QtSvg", "PyQt6.QtWebChannel", "PyQt6.QtPrintSupport", "PyQt6.QtMultimedia", "shield_sound"],
+    hiddenimports=["yara_x", "pefile", "PyQt6.QtSvg", "PyQt6.QtWebChannel", "PyQt6.QtPrintSupport"],
     hookspath=[],
     runtime_hooks=[],
     excludes=UNUSED,

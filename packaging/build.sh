@@ -65,11 +65,6 @@ fi
 # the Linux package also carries the PNG for the launcher entry
 if [ "$OS" = linux ] && [ ! -f packaging/shield.png ]; then QT_QPA_PLATFORM=offscreen "$PY" packaging/make_icon.py png; fi
 
-# ---- Tor for this system -----------------------------------------------------------------------------------
-# Each package carries only its own system's Tor (tor/tor_mac_arm64, tor/tor_lin_x64, ...). get_tor.py fetches it, checked against packaging/tor_lock.json.
-step "Tor (the private connection's program)"
-"$PY" packaging/get_tor.py || fail "Couldn't get Tor. If packaging/tor_lock.json doesn't exist yet, run once:  python packaging/get_tor.py --update"
-
 # ---- program -----------------------------------------------------------------------------------------------
 step "Packing the program (PyInstaller)"
 rm -rf dist build
@@ -80,24 +75,33 @@ else
   APP="dist/Shield"; EXE="$APP/Shield"
 fi
 [ -x "$EXE" ] || fail "$EXE wasn't produced"
+
+# ---- Tor: only THIS system's copy goes into the build (packaging/tor-bundles/<os>-<cpu>, fetched if missing) --------
+# macOS keeps it in Contents/Resources (shield_proxy.py looks there); Linux next to the Shield program.
+step "Adding Tor ($OS-$ARCH)"
+if [ "$OS" = macos ]; then TOR_DEST="$APP/Contents/Resources/tor"; else TOR_DEST="$APP/tor"; fi
+"$PY" packaging/tor_bundle.py install "$TOR_DEST" || fail "Couldn't add Tor to the build (see above)"
 echo "Program: $(du -sm "$APP" | cut -f1) MB"
 
 # ---- macOS: sign (Apple Silicon refuses to run unsigned code, so even without an Apple account it gets an ad-hoc signature)
 if [ "$OS" = macos ]; then
-  # Tor and its bridge programs are code too. Each is signed on its own first (inside out): Apple Silicon won't run an unsigned
-  # program and notarization rejects any unsigned program anywhere in the app. The Tor Project's own signature is replaced by yours.
-  step "Signing Tor and the bridge programs"
-  TOR_SIGN=(--force --sign "${SHIELD_CODESIGN_IDENTITY:--}")
-  [ -n "${SHIELD_CODESIGN_IDENTITY:-}" ] && TOR_SIGN+=(--options runtime --timestamp)
-  while IFS= read -r f; do
-    if file -b "$f" | grep -q "Mach-O"; then codesign "${TOR_SIGN[@]}" "$f" || fail "couldn't sign $f"; fi
-  done < <(find "$APP" -path "*/tor/tor_mac_*" -type f)
   if [ -n "${SHIELD_CODESIGN_IDENTITY:-}" ]; then
+    step "Signing the bundled Tor (Developer ID, hardened runtime)"
+    # Notarization rejects any unsigned program inside the app, and Tor, its libraries and the bridge programs are programs.
+    find "$TOR_DEST" -type f -print0 | while IFS= read -r -d '' f; do
+      file -b "$f" | grep -q 'Mach-O' || continue
+      codesign --force --options runtime --timestamp --sign "$SHIELD_CODESIGN_IDENTITY" "$f" || exit 1
+    done || fail "Signing the bundled Tor failed"
     step "Signing Shield.app (Developer ID, hardened runtime)"
     codesign --force --deep --options runtime --timestamp --entitlements packaging/macos/entitlements.plist \
              --sign "$SHIELD_CODESIGN_IDENTITY" "$APP" || fail "codesign failed"
     codesign --verify --deep --strict "$APP" || fail "The signature doesn't verify"
   else
+    step "Signing the bundled Tor (ad-hoc)"
+    find "$TOR_DEST" -type f -print0 | while IFS= read -r -d '' f; do
+      file -b "$f" | grep -q 'Mach-O' || continue
+      codesign --force --sign - "$f" || exit 1
+    done || fail "Signing the bundled Tor failed"
     step "Signing Shield.app (ad-hoc)"
     codesign --force --deep --sign - "$APP" || fail "ad-hoc codesign failed"
     printf '\033[33mNot signed with a Developer ID (SHIELD_CODESIGN_IDENTITY not set). macOS will warn people who download the .dmg.\033[0m\n'

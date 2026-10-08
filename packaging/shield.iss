@@ -57,6 +57,7 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 ; (Your settings, history and vault live in your user folder, not here, and are never touched.)
 Type: filesandordirs; Name: "{app}\_internal"
 Type: files; Name: "{app}\{#AppExe}"
+Type: filesandordirs; Name: "{app}\tor"
 
 [Files]
 Source: "..\dist\Shield\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
