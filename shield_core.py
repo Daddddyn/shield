@@ -85,6 +85,16 @@ DEFAULTS = {
     "check_updates": True,
     # hardened mode: JavaScript runs without the JIT compiler (needs a restart). Slower pages, far fewer exploitable bugs.
     "hardened_mode": False,
+    # private connection (shield_proxy.py): start with it already on
+    "proxy_on_start": False,
+    # what to do if the network blocks Tor, and the person's own bridge lines (validated again whenever they are used)
+    "proxy_bridge_mode": "auto",
+    "proxy_bridges": "",
+    # feel (shield_fx.py, shield_sound.py)
+    "fluid_motion": True,             # the water-drop tab reveal, ripples, the light around the address bar, smooth scrolling
+    "sound_effects": True,            # master switch for every sound (silent until audio files are put in the sounds folder)
+    "sound_volume": 65,               # percent
+    "scroll_sound": True,             # the scroll tick or bed, on top of the master switch
 }
 CHOICES = {
     "theme": {"dark", "light", "system"},
@@ -95,6 +105,8 @@ CHOICES = {
     "fingerprint_level": {"standard", "strict"},
     "startup": {"home", "restore"},
     "vault_autolock": {0, 5, 15, 60},
+    "sound_volume": {30, 65, 100},
+    "proxy_bridge_mode": {"auto", "off", "obfs4", "snowflake", "custom"},
 }
 RULES = {"nojs", "http", "noblock"}
 
@@ -118,7 +130,7 @@ class Settings(dict):
             pass
 
     def set(self, key, raw):
-        if key not in DEFAULTS or key in ("site_rules", "custom_blocklist", "filter_lists"):
+        if key not in DEFAULTS or key in ("site_rules", "custom_blocklist", "filter_lists", "proxy_bridges"):
             return False
         default = DEFAULTS[key]
         try:
@@ -162,6 +174,14 @@ class Settings(dict):
         self["filter_lists"][list_id] = bool(on)
         self.save()
         return True
+
+    def set_bridges(self, text):
+        """Save pasted bridge lines. Returns (how many were kept, how many were not usable)."""
+        from shield_proxy import parse_bridges
+        good, bad = parse_bridges(text)
+        self["proxy_bridges"] = "\n".join(good)
+        self.save()
+        return len(good), bad
 
     def set_blocklist(self, text):
         doms = []

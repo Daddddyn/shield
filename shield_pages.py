@@ -25,9 +25,13 @@ from PyQt6.QtWebEngineCore import QWebEngineUrlRequestJob, QWebEngineUrlSchemeHa
 from shield_core import (
     HOME, SEARCH_ENGINES, TRACKERS, VERSION, set_vt_key, site_of,
 )
+from shield_proxy import bundle_status
 from shield_icons import sprite
 
 esc = html.escape
+
+
+_ON = ' style="--p:1;--c:1"'     # a switch that starts on, drawn already in place
 
 
 def ic(name, size=18, cls=""):
@@ -38,7 +42,7 @@ def ic(name, size=18, cls=""):
 # Design system
 # --------------------------------------------------------------------------
 CSS = r"""
-:root{--ease:cubic-bezier(.22,1,.36,1);--spring:cubic-bezier(.34,1.45,.5,1);--r:14px;
+:root{--ease:cubic-bezier(.22,1,.36,1);--smooth:linear(0,0.009,0.032,0.067,0.109,0.155,0.205,0.256,0.307,0.358,0.407,0.454,0.499,0.542,0.582,0.619,0.654,0.686,0.716,0.743,0.768,0.791,0.811,0.83,0.848,0.863,0.877,0.89,0.902,0.912,0.921,0.93,0.937,0.944,0.95,0.956,0.961,0.965,0.969,0.972,0.975,0.978,0.981,0.983,0.985,0.986,0.988,0.989,0.991,0.992,0.993,0.993,0.994,0.995,0.995,0.996,0.996,0.997,0.997,0.998,0.998,0.998,0.998,1);--spring:linear(0,0.007,0.028,0.059,0.098,0.144,0.194,0.246,0.301,0.356,0.411,0.465,0.517,0.567,0.614,0.659,0.701,0.74,0.776,0.809,0.839,0.866,0.89,0.912,0.931,0.948,0.962,0.975,0.986,0.995,1.002,1.009,1.014,1.017,1.02,1.023,1.024,1.025,1.025,1.025,1.025,1.024,1.023,1.022,1.021,1.02,1.018,1.017,1.015,1.014,1.013,1.011,1.01,1.009,1.008,1.007,1.006,1.005,1.004,1.004,1.003,1.002,1.002,1);--r:14px;
 color-scheme:dark;--bg:#111113;--side:#161618;--surface:#1c1c1f;--surface2:#27272b;--thumb:#3d3d43;--hover:rgba(255,255,255,.06);
 --line:rgba(255,255,255,.085);--text:#f5f5f7;--mut:#a1a1a8;--faint:#6c6c73;--acc:#0a84ff;--acc-t:#58a8ff;
 --ok:#32d74b;--okf:#30d158;--warn:#ffb340;--bad:#ff5a50;--shadow:0 1px 2px rgba(0,0,0,.4),0 18px 48px rgba(0,0,0,.45)}
@@ -46,7 +50,7 @@ color-scheme:dark;--bg:#111113;--side:#161618;--surface:#1c1c1f;--surface2:#2727
 --line:rgba(0,0,0,.09);--text:#1d1d1f;--mut:#6e6e73;--faint:#a1a1a6;--acc:#007aff;--acc-t:#0062cc;
 --ok:#1e8a39;--okf:#34c759;--warn:#a85a00;--bad:#d1281d;--shadow:0 1px 2px rgba(0,0,0,.06),0 18px 48px rgba(0,0,0,.14)}
 *{box-sizing:border-box}
-html{background:var(--bg)}
+html{background:var(--bg);scrollbar-gutter:stable;scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",system-ui,"Helvetica Neue",sans-serif;
 -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
 a{color:var(--acc-t);text-decoration:none;transition:opacity .2s}a:hover{opacity:.75}
@@ -63,12 +67,13 @@ nav a .ic{color:var(--mut);transition:color .2s}
 nav a:hover{background:var(--hover);opacity:1}
 nav a.on{background:color-mix(in srgb,var(--acc) 17%,transparent);color:var(--acc-t);font-weight:560}nav a.on .ic{color:var(--acc-t)}
 main{flex:1;min-width:0;max-width:840px;margin:0 auto;padding:46px 44px 140px}
-@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes softin{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 @keyframes pop{0%{opacity:0;transform:scale(.6)}60%{opacity:1;transform:scale(1.08)}100%{transform:scale(1)}}
 @keyframes rot{to{transform:rotate(360deg)}}
 @keyframes slide{0%{transform:translateX(-110%)}100%{transform:translateX(310%)}}
-main>*{animation:rise .7s var(--ease) both}
+main>*{animation:rise .6s var(--ease) both}
 h1{font-size:32px;line-height:1.1;letter-spacing:-.032em;font-weight:660;margin:0 0 8px}
 .lede{color:var(--mut);margin:0 0 30px;max-width:58ch;font-size:15px;line-height:1.5}
 h2{font-size:13px;font-weight:600;color:var(--mut);margin:36px 0 9px 6px}
@@ -77,16 +82,14 @@ h2{font-size:13px;font-weight:600;color:var(--mut);margin:36px 0 9px 6px}
 .item+.item::before{content:"";position:absolute;top:0;left:16px;right:0;height:1px;background:var(--line)}
 .grow{flex:1;min-width:0}.t{font-weight:520;font-size:14px}.d{color:var(--mut);font-size:12.5px;margin-top:2px;line-height:1.45}
 .ctl{display:flex;align-items:center;gap:8px;flex:none}
-.sw{position:relative;width:46px;height:28px;flex:none;cursor:pointer}
-.sw input{position:absolute;inset:0;opacity:0;margin:0;cursor:pointer;z-index:1}
-.sw i{position:absolute;inset:0;border-radius:99px;background:color-mix(in srgb,var(--mut) 32%,transparent);transition:background .32s var(--ease)}
-.sw i::after{content:"";position:absolute;top:2px;left:2px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 2px 5px rgba(0,0,0,.28);transition:transform .4s var(--spring),width .22s var(--ease)}
-.sw input:checked+i{background:var(--okf)}.sw input:checked+i::after{transform:translateX(18px)}
-.sw input:active+i::after{width:29px}.sw input:checked:active+i::after{transform:translateX(13px)}
+.sw{--p:0;--c:0;--s:0;--off:color-mix(in srgb,var(--mut) 32%,transparent);position:relative;width:51px;height:31px;flex:none;cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent}
+.sw input{position:absolute;inset:0;opacity:0;margin:0;pointer-events:none}
+.sw i{position:absolute;inset:0;border-radius:99px;background:color-mix(in srgb,var(--okf) calc(var(--c)*100%),var(--off))}
+.sw i::after{content:"";position:absolute;top:2px;left:2px;width:calc(27px + var(--s)*7px);height:27px;border-radius:99px;background:#fff;box-shadow:0 3px 8px rgba(0,0,0,.15),0 1px 1px rgba(0,0,0,.16),0 3px 1px rgba(0,0,0,.1);transform:translate3d(calc(var(--p)*20px - var(--s)*var(--p)*7px),0,0);will-change:transform}
 .sw input:focus-visible+i{outline:2px solid color-mix(in srgb,var(--acc) 70%,transparent);outline-offset:2px}
 .btn{appearance:none;border:0;font:inherit;font-weight:520;font-size:13px;color:var(--text);background:var(--surface2);padding:7px 14px;border-radius:9px;cursor:pointer;
-display:inline-flex;align-items:center;gap:7px;line-height:1.25;white-space:nowrap;transition:background .2s var(--ease),transform .25s var(--ease),opacity .2s,color .2s}
-.btn:hover{background:color-mix(in srgb,var(--surface2) 82%,var(--text));opacity:1}.btn:active{transform:scale(.955)}
+display:inline-flex;align-items:center;gap:7px;line-height:1.25;white-space:nowrap;transition:background .2s var(--ease),transform .5s var(--spring),opacity .2s,color .2s}
+.btn:hover{background:color-mix(in srgb,var(--surface2) 82%,var(--text));opacity:1}.btn:active{transform:scale(.955);transition-duration:.2s,.08s,.2s,.2s}
 .btn.pri{background:var(--acc);color:#fff}.btn.pri:hover{background:color-mix(in srgb,var(--acc) 86%,#fff)}
 .btn.dng{color:var(--bad)}.btn.dng.fill{background:var(--bad);color:#fff}
 .btn.ghost{background:transparent}.btn.ghost:hover{background:var(--hover)}
@@ -99,9 +102,9 @@ select.inp{appearance:none;padding-right:32px;cursor:pointer;background-repeat:n
 background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9.5l6 6 6-6'/%3E%3C/svg%3E")}
 textarea.inp{width:100%;min-height:100px;font:12.5px/1.6 ui-monospace,Menlo,Consolas,monospace;resize:vertical;padding:10px 12px}
 .seg{position:relative;display:inline-flex;background:var(--surface2);border-radius:10px;padding:2px}
-.seg button{position:relative;z-index:1;appearance:none;border:0;background:none;font:inherit;font-size:13px;font-weight:520;color:var(--mut);padding:5px 14px;border-radius:8px;cursor:pointer;transition:color .3s}
+.seg button{position:relative;z-index:1;appearance:none;border:0;background:none;font:inherit;font-size:13px;font-weight:520;color:var(--mut);padding:5px 14px;border-radius:8px;cursor:pointer;transition:color .22s var(--ease)}
 .seg button.on{color:var(--text)}
-.seg .thumb{position:absolute;top:2px;bottom:2px;left:0;border-radius:8px;background:var(--thumb);box-shadow:0 1px 3px rgba(0,0,0,.22),0 0 0 .5px var(--line);transition:transform .5s var(--spring),width .5s var(--ease)}
+.seg .thumb{position:absolute;top:2px;bottom:2px;left:0;border-radius:8px;background:var(--thumb);box-shadow:0 1px 3px rgba(0,0,0,.22),0 0 0 .5px var(--line);will-change:transform}
 .chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:560;padding:2px 9px;border-radius:99px;background:var(--surface2);color:var(--mut);line-height:1.5}
 .chip.ok{color:var(--ok);background:color-mix(in srgb,var(--okf) 15%,transparent)}.chip.warn{color:var(--warn);background:color-mix(in srgb,var(--warn) 16%,transparent)}
 .chip.bad{color:var(--bad);background:color-mix(in srgb,var(--bad) 15%,transparent)}.chip.acc{color:var(--acc-t);background:color-mix(in srgb,var(--acc) 16%,transparent)}
@@ -118,9 +121,9 @@ textarea.inp{width:100%;min-height:100px;font:12.5px/1.6 ui-monospace,Menlo,Cons
 .empty{padding:34px 16px;text-align:center;color:var(--mut)}
 .find{display:flex;align-items:center;gap:10px;background:var(--surface);box-shadow:0 0 0 1px var(--line);border-radius:12px;padding:0 6px 0 14px;margin-bottom:6px;color:var(--mut)}
 .find input{flex:1;background:none;border:0;outline:0;color:var(--text);font:inherit;padding:11px 0}
-.col{display:grid;grid-template-rows:1fr;transition:grid-template-rows .5s var(--ease),opacity .35s var(--ease)}
+.col{display:grid;grid-template-rows:1fr;transition:grid-template-rows .45s var(--ease),opacity .45s var(--ease)}
 .col>.in{overflow:hidden;min-height:0}.col.gone{grid-template-rows:0fr;opacity:0}
-.gap{margin-bottom:12px;transition:margin .5s var(--ease)}.gap.gone{margin-bottom:0}
+.gap{margin-bottom:12px;transition:margin .45s var(--ease)}.gap.gone{margin-bottom:0}
 /* downloads */
 .dl{background:var(--surface);border-radius:var(--r);box-shadow:0 0 0 1px var(--line)}
 .dl-h{display:flex;align-items:center;gap:14px;padding:14px 16px}
@@ -137,7 +140,7 @@ textarea.inp{width:100%;min-height:100px;font:12.5px/1.6 ui-monospace,Menlo,Cons
 .verdict h4{margin:0;font-size:14.5px;font-weight:620;letter-spacing:-.01em;color:var(--tone)}.verdict p{margin:2px 0 0;color:var(--text);opacity:.82;font-size:13px;line-height:1.5}
 .tone-ok{--tone:var(--ok)}.tone-warn{--tone:var(--warn)}.tone-bad{--tone:var(--bad)}.tone-info{--tone:var(--acc-t)}
 .ring{width:18px;height:18px;border-radius:50%;border:2.2px solid color-mix(in srgb,var(--acc) 22%,transparent);border-top-color:var(--acc);animation:rot .75s linear infinite}
-.more{display:grid;grid-template-rows:0fr;transition:grid-template-rows .5s var(--ease)}.more.open{grid-template-rows:1fr}
+.more{display:grid;grid-template-rows:0fr;transition:grid-template-rows .45s var(--ease)}.more.open{grid-template-rows:1fr}
 .more>div{overflow:hidden;min-height:0}
 .pane{border-top:1px solid var(--line);padding:6px 16px 14px}
 .pane h5{margin:14px 0 6px;font-size:12px;font-weight:600;color:var(--mut)}
@@ -149,7 +152,7 @@ textarea.inp{width:100%;min-height:100px;font:12.5px/1.6 ui-monospace,Menlo,Cons
 /* sheet + toast */
 .sheet-bg{position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:rgba(0,0,0,.42);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);opacity:0;transition:opacity .3s var(--ease);z-index:50}
 .sheet-bg.on{opacity:1}
-.sheet{width:min(420px,100%);background:var(--surface);border-radius:20px;padding:26px 24px 20px;box-shadow:var(--shadow),0 0 0 1px var(--line);text-align:center;transform:translateY(18px) scale(.95);opacity:0;transition:transform .5s var(--spring),opacity .3s var(--ease)}
+.sheet{will-change:transform,opacity;width:min(420px,100%);background:var(--surface);border-radius:20px;padding:26px 24px 20px;box-shadow:var(--shadow),0 0 0 1px var(--line);text-align:center;transform:translateY(18px) scale(.95);opacity:0;transition:transform .5s var(--spring),opacity .3s var(--ease)}
 .sheet-bg.on .sheet{transform:none;opacity:1}
 .sheet .bd{width:52px;height:52px;border-radius:50%;margin:0 auto 14px;display:grid;place-items:center;color:var(--tone,var(--acc-t));background:color-mix(in srgb,var(--tone,var(--acc)) 16%,transparent)}
 .sheet h3{margin:0 0 6px;font-size:18px;font-weight:640;letter-spacing:-.02em}.sheet p{margin:0 0 4px;color:var(--mut);line-height:1.5;font-size:13.5px}
@@ -199,7 +202,9 @@ box-shadow:0 0 0 1px var(--line),0 6px 22px rgba(0,0,0,.14);transition:box-shado
 @media(max-width:760px){nav{display:none}main{padding:28px 18px 120px}}
 @media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 """
-CSS += "".join(f"main>*:nth-child({i}){{animation-delay:{(i - 1) * 45}ms}}" for i in range(2, 16))
+CSS += "".join(f"main>*:nth-child({i}){{animation-delay:{(i - 1) * 32}ms}}" for i in range(2, 16))
+# Arriving from another internal page: a short fade, no staggered intro, so switching sections feels instant.
+CSS += ".soft main>*{animation:softin .2s var(--ease) both!important;animation-delay:0ms!important}\n"
 
 BASE_JS = r"""
 const T="__T__",NS="http://www.w3.org/2000/svg",$=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
@@ -217,9 +222,34 @@ function sheet({icon="info",tone="",title,body,field,actions}){return new Promis
   h("div",{class:"sheet",role:"dialog","aria-modal":"true"},h("div",{class:"bd"},ic(icon,26)),h("h3",{},title),h("p",{},body),inp,h("div",{class:"btns"},btns)));
  document.body.append(bg);document.addEventListener("keydown",key,true);bg.offsetWidth;bg.classList.add("on");if(inp)setTimeout(()=>inp.focus(),120);
 })}
-function seg(el,onpick){const th=h("i",{class:"thumb"});el.append(th);const bs=$$("button",el);
- const put=(b,anim)=>{if(!anim)th.style.transition="none";th.style.width=b.offsetWidth+"px";th.style.transform=`translateX(${b.offsetLeft}px)`;if(!anim){th.offsetWidth;th.style.transition=""}};
+const RM=matchMedia("(prefers-reduced-motion:reduce)").matches;
+const SPR=(x,v,t,w,z,dt)=>{const d=x-t;if(z>=.999){const e=Math.exp(-w*dt),j=v+w*d;return[t+(d+j*dt)*e,(v-j*w*dt)*e]}
+ const wd=w*Math.sqrt(1-z*z),e=Math.exp(-z*w*dt),c=Math.cos(wd*dt),s=Math.sin(wd*dt),b=(v+z*w*d)/wd;return[t+e*(d*c+b*s),e*(v*c-((z*w*v+w*w*d)/wd)*s)]};
+function springer(step){let raf=0,last=0;const f=t=>{const dt=Math.min(.05,Math.max(.001,(t-last)/1000));last=t;raf=step(dt)?requestAnimationFrame(f):0};
+ return()=>{if(!raf){last=performance.now();raf=requestAnimationFrame(f)}}}
+function sw(el){const inp=$("input",el);if(!inp||el._sw)return;el._sw=1;
+ const dsc=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"checked"),want=()=>dsc.get.call(inp)?1:0;
+ let P=want(),PV=0,S=0,SV=0,press=false,drag=null;
+ const paint=()=>{el.style.setProperty("--p",P.toFixed(4));el.style.setProperty("--c",Math.min(1,Math.max(0,P)).toFixed(3));el.style.setProperty("--s",S.toFixed(4))};
+ const go=springer(dt=>{const dr=drag&&drag.moved,tp=dr?drag.p:want(),ts=press?1:0;
+  [P,PV]=SPR(P,PV,tp,dr?70:18,dr?1:.78,dt);[S,SV]=SPR(S,SV,ts,34,1,dt);
+  const rest=Math.abs(P-tp)<.0008&&Math.abs(PV)<.01&&Math.abs(S-ts)<.001&&Math.abs(SV)<.01;if(rest){P=tp;S=ts;PV=SV=0}paint();return!rest});
+ const kick=()=>{if(RM){P=want();S=0;PV=SV=0;paint()}else go()};
+ const set=v=>{if(!!want()===v)return;dsc.set.call(inp,v);inp.dispatchEvent(new Event("change",{bubbles:true}));kick()};
+ Object.defineProperty(inp,"checked",{get(){return dsc.get.call(inp)},set(v){dsc.set.call(inp,v);kick()},configurable:true});
+ inp.addEventListener("change",kick);
+ el.addEventListener("click",e=>{if(e.target!==inp)e.preventDefault()});
+ el.addEventListener("pointerdown",e=>{if(e.button||inp.disabled)return;try{el.setPointerCapture(e.pointerId)}catch(x){}press=true;drag={x0:e.clientX,base:want(),moved:false,p:want()};kick()});
+ el.addEventListener("pointermove",e=>{if(!drag)return;const dx=e.clientX-drag.x0;if(!drag.moved&&Math.abs(dx)>3)drag.moved=true;if(drag.moved){drag.p=Math.min(1,Math.max(0,drag.base+dx/20));kick()}});
+ const end=ok=>{if(!drag)return;const d=drag;drag=null;press=false;if(ok){if(d.moved)set(d.p>.5);else set(!want())}kick()};
+ el.addEventListener("pointerup",()=>end(true));el.addEventListener("pointercancel",()=>end(false));paint()}
+$$(".sw").forEach(sw);new MutationObserver(()=>$$(".sw").forEach(sw)).observe(document.body,{childList:true,subtree:true});
+function seg(el,onpick){const th=h("i",{class:"thumb"});el.append(th);const bs=$$("button",el);let X=0,XV=0,W=0,WV=0,tx=0,tw=0,ready=false;
  const cur=()=>bs.find(b=>b.classList.contains("on"))||bs[0];
+ const paint=()=>{th.style.width=W.toFixed(2)+"px";th.style.transform="translate3d("+X.toFixed(2)+"px,0,0)"};
+ const go=springer(dt=>{[X,XV]=SPR(X,XV,tx,22,.82,dt);[W,WV]=SPR(W,WV,tw,22,.82,dt);
+  const rest=Math.abs(X-tx)<.03&&Math.abs(W-tw)<.03&&Math.abs(XV)<.5&&Math.abs(WV)<.5;if(rest){X=tx;W=tw;XV=WV=0}paint();return!rest});
+ const put=(b,anim)=>{tx=b.offsetLeft;tw=b.offsetWidth;if(!anim||!ready||RM){X=tx;W=tw;XV=WV=0;paint();ready=true}else go()};
  requestAnimationFrame(()=>put(cur(),false));if(document.fonts)document.fonts.ready.then(()=>put(cur(),false));
  bs.forEach(b=>b.addEventListener("click",()=>{if(b===cur())return;bs.forEach(x=>x.classList.toggle("on",x===b));put(b,true);onpick&&onpick(b.dataset.v)}))}
 function countUp(el,to){const from=+el.dataset.v||0;el.dataset.v=to;if(from===to){el.textContent=to.toLocaleString();return}
@@ -239,6 +269,7 @@ class Ctx:
         self.token = secrets.token_urlsafe(24)
         self.app = None        # set to the Browser window
         self.engine = {"chromium": "unknown", "flags": ""}
+        self.soft_to = None    # (page, time) set when the user clicks from one internal page to another
 
 
 def shell(ctx, title, body, script="", nav=None):
@@ -250,9 +281,13 @@ def shell(ctx, title, body, script="", nav=None):
     csp = (f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; "
            "img-src data:; connect-src shield:; form-action https:; base-uri 'none'")
     theme = ctx.app.resolved_theme() if ctx.app else "dark"
+    soft = False
+    if nav is not None and ctx.soft_to and ctx.soft_to[0] == nav and time.monotonic() - ctx.soft_to[1] < 3.0:
+        soft = True
+    ctx.soft_to = None
     js = BASE_JS.replace("__T__", ctx.token) + script
     main = f"<main>{body}</main>" if nav is not None else body
-    return (f'<!doctype html><html data-theme="{esc(theme)}"><head><meta charset="utf-8">'
+    return (f'<!doctype html><html data-theme="{esc(theme)}"{" class=soft" if soft else ""}><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<meta http-equiv="Content-Security-Policy" content="{csp}"><title>{esc(title)}</title>'
             f'<style>{CSS}</style></head><body>{sprite()}<div class="shell">{side}{main}</div>'
@@ -310,7 +345,7 @@ def _item(label, desc="", control=""):
 
 def toggle(cfg, key, label, desc):
     on = "checked" if cfg[key] else ""
-    return _item(label, desc, f'<label class="sw"><input type="checkbox" data-k="{key}" {on}><i></i></label>')
+    return _item(label, desc, f'<label class="sw"{_ON if on else ""}><input type="checkbox" data-k="{key}" {on}><i></i></label>')
 
 
 def segmented(cfg, key, label, desc, options):
@@ -364,6 +399,15 @@ def page_settings(ctx, q):
         + toggle(c, "hardened_mode", "Hardened mode (no JIT)",
                  "Runs JavaScript without the JIT compiler, which most browser exploits rely on. Heavy pages, games and web apps run slower, and WebAssembly stops working. Needs a restart.")
     )
+    feel = (
+        toggle(c, "fluid_motion", "Fluid motion", "Tabs fall open like a drop of water, buttons ripple, the address bar glows when you click it, "
+               "and pages scroll smoothly. Turn it off for a calmer browser. Windows' own 'animation effects' setting is respected too.")
+        + toggle(c, "sound_effects", "Sound effects", "Soft sounds for clicks, tabs and unlocking. Sounds come from the files in Shield's sounds folder; "
+                 "with no files there, Shield stays silent.")
+        + segmented(c, "sound_volume", "Sound volume", "How loud the sound effects are, relative to your computer's volume.",
+                    [(30, "Low"), (65, "Medium"), (100, "High")])
+        + toggle(c, "scroll_sound", "Scroll sound", "A sound that follows your scrolling. Needs sound effects to be on.")
+    )
     app0 = ctx.app
     summ = app0.protection_summary() if app0 else {"network": 0, "cosmetic": 0, "threats": 0, "ready": False}
     privacy = (
@@ -392,7 +436,7 @@ def page_settings(ctx, q):
     for it in (app0.list_status() if app0 else {"lists": []})["lists"]:
         chk = "checked" if it["on"] else ""
         list_rows += _item(esc(it["name"]), f'{esc(it["desc"])}<br><span data-lst="{esc(it["id"])}">{esc(_list_line(it))}</span>',
-                           f'<label class="sw"><input type="checkbox" data-list="{esc(it["id"])}" {chk}><i></i></label>')
+                           f'<label class="sw"{_ON if chk else ""}><input type="checkbox" data-list="{esc(it["id"])}" {chk}><i></i></label>')
     lists = (list_rows
              + toggle(c, "auto_update_lists", "Keep lists up to date", "Fetches the lists in the background every few days over HTTPS. The requests carry no cookies, no account and no history.")
              + _item("Update now", f'<span id="lstsum">{esc(_summary_line(summ))}</span>', '<button class="btn pri" id="lstupd">Update lists</button>'))
@@ -427,7 +471,7 @@ def page_settings(ctx, q):
             right += '<a class="btn" target="_blank" href="https://www.clamav.net/downloads">Get ClamAV</a>'
         if e["available"] or key != "defender":
             chk = "checked" if c.get(f"scan_{key}", True) else ""
-            right += f'<label class="sw"><input type="checkbox" data-k="scan_{key}" {chk}><i></i></label>'
+            right += f'<label class="sw"{_ON if chk else ""}><input type="checkbox" data-k="scan_{key}" {chk}><i></i></label>'
         scan_rows += _item(esc(e["name"]), f'<span data-eng="{key}">{esc(e["detail"])}</span>', right)
     has_key = bool(app and app.has_vt_key())
     if has_key:
@@ -438,6 +482,20 @@ def page_settings(ctx, q):
                 f'<span id="vtkeyctl" class="ctl">{keyctl}</span>')
           + toggle(c, "vt_auto_lookup", "Look up new downloads automatically", "Sends only the file's SHA-256 fingerprint, never the file.")
           + toggle(c, "vt_confirm_upload", "Ask before uploading a file", "Uploaded files can be seen by VirusTotal and the security companies it works with. Leave this on for anything private."))
+    bs = bundle_status()
+    if not bs["tor"]:
+        comp = "The private connection component is not part of this copy of Shield, so the globe button is switched off."
+    else:
+        have = [n for n, k in (("obfs4", "obfs4"), ("Snowflake", "snowflake")) if bs[k]]
+        comp = ("Bridge support in this copy of Shield: " + (" and ".join(have) if have else "none, only direct Tor") + ".")
+    proxy = (
+        toggle(c, "proxy_on_start", "Private connection on at startup",
+               "Shield has a private connection built in (the globe button in the toolbar). It sends your browsing through Tor, so your network and internet provider can see that you use Tor but not which sites you visit. Pages load slower. Turn this on to start every session with it already running.")
+        + segmented(c, "proxy_bridge_mode", "If your network blocks Tor",
+                    "Work, school and some national networks block Tor. Automatic tries a normal connection first, then obfs4 and Snowflake bridges, which disguise Tor traffic, then your own bridges if you added any. " + esc(comp),
+                    [("auto", "Automatic"), ("off", "No bridges"), ("obfs4", "obfs4"), ("snowflake", "Snowflake"), ("custom", "My bridges")])
+        + f'''<div class="item" style="display:block"><div class="d" style="margin:0 0 10px">Your own bridges, one per line, from bridges.torproject.org. Lines that don't look like bridges are ignored.</div>
+<textarea class="inp" id="pbr" spellcheck="false" placeholder="obfs4 192.0.2.1:443 0123456789ABCDEF0123456789ABCDEF01234567 cert=... iat-mode=0">{esc(c["proxy_bridges"])}</textarea><div style="margin-top:10px"><button class="btn" id="savebr">Save bridges</button></div></div>''')
     rules = ""
     for host, rl in sorted(c["site_rules"].items()):
         for r in rl:
@@ -452,7 +510,9 @@ def page_settings(ctx, q):
     body = f"""
 <h1>Settings</h1><p class="lede">Everything stays on this computer. Shield has no accounts, sync, telemetry or crash reporting.</p>
 <h2>General</h2><div class="group">{general}</div>
+<h2>Motion and sound</h2><div class="group">{feel}</div>
 <h2>Privacy and security</h2><div class="group">{privacy}</div>
+<h2>Private connection</h2><div class="group">{proxy}</div>
 <h2 id="lists">Protection lists</h2><div class="group">{lists}</div>
 <h2>Passwords</h2><div class="group">{pw}</div>
 <h2>Permissions</h2><div class="group">{perms}</div>
@@ -479,6 +539,9 @@ $$(".seg[data-k]").forEach(el=>seg(el,v=>save(el.dataset.k,v)));seg($("#rr"));
 $("#addrule").onclick=async()=>{const hst=$("#rh").value.trim().toLowerCase();if(!hst)return;const r=await api("site/add",{host:hst,rule:$("#rr .on").dataset.v});if(r.ok)location.reload();else toast("That isn't a valid host")};
 $$("[data-delrule]").forEach(b=>b.onclick=async()=>{await api("site/del",{host:b.dataset.h,rule:b.dataset.r});location.reload()});
 $("#savebl").onclick=async()=>{await api("blocklist",{text:$("#bl").value});toast("List saved")};
+$("#savebr").onclick=async()=>{const r=await api("proxy/bridges",{text:$("#pbr").value});
+ if(!r.ok){toast("Not saved");return}
+ toast(r.count?(r.count+(r.count===1?" bridge":" bridges")+" saved"+(r.bad?", "+r.bad+" line"+(r.bad===1?"":"s")+" ignored":"")):(r.bad?"None of those look like bridge lines":"Bridges cleared"))};
 $$("[data-clear]").forEach(b=>b.onclick=async()=>{const k=b.dataset.clear;
  if(k==="all"){const a=await sheet({icon:"trash",tone:"bad",title:"Clear everything?",body:"This removes history, cookies, cached files and the download list. Files you've already downloaded stay where they are.",actions:[{label:"Clear everything",kind:"dng fill",value:"ok"},{label:"Cancel",kind:"ghost",value:null}]});if(a!=="ok")return}
  await api("clear",{what:k});toast("Cleared")});
@@ -669,7 +732,7 @@ s.addEventListener("input",()=>{clearTimeout(ft);ft=setTimeout(()=>{const q=s.va
  $$("[data-day]").forEach(d=>{let el=d.nextElementSibling,any=false;while(el&&!el.dataset.day){if(el.style.display!=="none")any=true;el=el.nextElementSibling}d.style.display=any?"":"none"});
  $("#nomatch").style.display=n||!rows.length?"none":"block"},90)});
 document.addEventListener("keydown",e=>{if(e.key==="/"&&document.activeElement!==s){e.preventDefault();s.focus()}else if(e.key==="Escape"&&s.value){s.value="";s.dispatchEvent(new Event("input"))}});
-function gone(row,fn){const grp=row.closest(".group");row.style.transition="opacity .25s var(--ease)";row.style.opacity=0;setTimeout(()=>{row.remove();fn&&fn()},230)}
+function gone(row,fn){const done=()=>{row.remove();fn&&fn()};if(!row.animate||matchMedia("(prefers-reduced-motion:reduce)").matches){done();return}const h0=row.getBoundingClientRect().height;row.style.overflow="hidden";row.style.pointerEvents="none";const a=row.animate([{height:h0+"px",opacity:1,transform:"none"},{height:"0px",opacity:0,paddingTop:"0px",paddingBottom:"0px",marginTop:"0px",marginBottom:"0px",transform:"translateX(-8px)"}],{duration:340,easing:"cubic-bezier(.22,1,.36,1)",fill:"forwards"});a.onfinish=done;a.oncancel=done}
 """
 
 
@@ -930,6 +993,9 @@ def handle_api(ctx, path, q):
     if path == "blocklist":
         c.set_blocklist(q.get("text", ""))
         return {"ok": True}
+    if path == "proxy/bridges":
+        n, bad = c.set_bridges(q.get("text", ""))
+        return {"ok": True, "count": n, "bad": bad}
     if path == "clear":
         app.clear_data(q.get("what", ""))
         return {"ok": True}

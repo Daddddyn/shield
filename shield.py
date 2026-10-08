@@ -48,6 +48,17 @@ _FLAGS = [
     "--autoplay-policy=document-user-activation-required",  # no video or audio starts by itself
     "--enable-strict-powerful-feature-restrictions",        # camera, location and similar only on secure pages
 ]
+# The private connection (shield_proxy.py). Chromium only reads its proxy at launch, so it is always pointed at a small switch
+# inside Shield (127.0.0.1, random port). While the toolbar toggle is off the switch connects straight to the site; when it is on,
+# everything goes through the Tor that ships with Shield, with a kill switch so nothing leaks while Tor is still connecting.
+PROXY = None
+try:
+    from shield_proxy import PrivacyProxy
+    PROXY = PrivacyProxy()
+    _FLAGS.append(f"--proxy-server=socks5://127.0.0.1:{PROXY.start()}")
+except Exception as _e:         # without it the browser still works, just without the toggle
+    PROXY = None
+    STARTUP_WARNINGS.append(f"The private connection is unavailable: {_e}")
 if HARDENED:
     _FLAGS.append("--js-flags=--jitless")                  # no JIT: most browser exploits need it (this also turns off WebAssembly)
 
@@ -78,7 +89,7 @@ from PyQt6.QtCore import (
     QAbstractNativeEventFilter, QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QObject, QPoint, QPointF, QSize, Qt, QTimer,
     QUrl, QUrlQuery, pyqtSignal,
 )
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPalette, QPixmap
+from PyQt6.QtGui import QAction, QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPalette, QPixmap
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt6.QtWebChannel import QWebChannel
@@ -97,6 +108,8 @@ except ImportError:          # older Qt: the page menu then simply offers fewer 
     QWebEngineContextMenuRequest = None
 from PyQt6.QtCore import QStringListModel
 
+import shield_fx
+import shield_sound
 import shield_update
 import shield_vault
 from shield_autofill import VaultBridge, qwebchannel_js
@@ -106,11 +119,13 @@ from shield_core import (
     mark_of_the_web, site_of, unique_path,
 )
 from shield_filters import AD_LIST_IDS, ListManager, clean_url
+from shield_fx import DropReveal, fx_on
 from shield_pages import Ctx, SchemeHandler, _list_line, _summary_line
 from shield_scripts import VAULT_JS, YT_JS, fill_call, fp_script, is_youtube_host
 from shield_scan import ScanEngine, VirusTotal, VTError, label_for_name, sha256_file
+from shield_sound import ScrollFeel, ScrollWatcher, SoundEngine, play as play_sound, sound_folders
 from shield_ui import (
-    Chrome, FindBar, IconButton, Omnibox, Pill, Sheet, T, TabCard, TabSearch, TabStrip, ViewHost, pix, soften_menu, stylesheet,
+    Chrome, FindBar, IconButton, Omnibox, Pill, Sheet, T, TabCard, TabSearch, TabStrip, ViewHost, pix, soften_menu, stylesheet, usable_grab,
 )
 
 
@@ -199,6 +214,13 @@ class SafePage(QWebEnginePage):
         self.certificateError.connect(self._cert_error)
         self.loadFinished.connect(self._after_load)
         self.loadStarted.connect(self._on_start)
+        # The engine paints its base colour before a page's first frame. Left alone that is white, which is the flash
+        # between pages. Keep it matched to the theme (see sync_bg) and follow theme changes.
+        self._busy = False
+        self.urlChanged.connect(self.sync_bg)
+        self.loadFinished.connect(self._bg_done)
+        T.changed.connect(self.sync_bg)
+        self.sync_bg()
         self.windowCloseRequested.connect(lambda: self.b.close_page(self))
         self.recentlyAudibleChanged.connect(lambda _a: self.b.on_audio(self))
         self.pdfPrintingFinished.connect(lambda path, ok: self.b.toast("Saved the page as a PDF" if ok else "Couldn't save the PDF"))
@@ -214,6 +236,28 @@ class SafePage(QWebEnginePage):
     def _on_start(self):
         self.starts += 1
         self.login = {}
+        self._busy = True
+        self.sync_bg()
+
+    def _bg_done(self, *_):
+        self._busy = False
+        self.sync_bg()
+
+    def sync_bg(self, *_):
+        """Colour shown under a page until it has painted. Internal and blank pages, and any page that is still loading
+        in dark mode, sit on the theme's own background, so a navigation never flashes white. Once a website has
+        finished loading it gets plain white, because a site that sets no background of its own expects white behind
+        its black text."""
+        try:
+            dark = self.b.is_dark()
+            if self.url().scheme() in ("shield", "about", "") or (dark and self._busy):
+                col = QColor("#111113") if dark else QColor("#f5f5f7")      # same as --bg in shield_pages.py
+            else:
+                col = QColor("#ffffff")
+            if self.backgroundColor() != col:
+                self.setBackgroundColor(col)
+        except Exception:
+            pass
 
     def vault_seen(self, d):
         self.login = {"pw": bool(d.get("pw")), "newpw": bool(d.get("newpw")), "user": bool(d.get("user")), "cross": bool(d.get("cross"))}
@@ -288,6 +332,12 @@ class SafePage(QWebEnginePage):
                 or self.url().scheme() == "shield"
             if not ok:
                 self.b.events.add("navigation", "blocked a website from opening a shield:// page")
+            elif nav_type == N.NavigationTypeLinkClicked and self.url().scheme() == "shield":
+                # moving between internal pages: tell the next page to settle in quietly instead of replaying its intro
+                try:
+                    self.b.ctx.soft_to = (url.host(), time.monotonic())
+                except Exception:
+                    pass
             return ok
         if scheme in ("http", "https"):
             host = url.host().lower()
@@ -351,6 +401,9 @@ class Tab(QWebEngineView):
         super().__init__()
         self.setPage(SafePage(browser, self))
         self.loading = False
+        feel = getattr(browser.core, "scroll_feel", None)
+        if feel is not None:
+            ScrollWatcher(self, feel)         # lets the scroll sound follow how far the page really moves
 
     def contextMenuEvent(self, e):
         try:
@@ -422,6 +475,10 @@ class Core(QObject):
         self._quitting = False
         self._down = False
         self.cfg = Settings()
+        self.sounds = SoundEngine(sound_folders(Path(__file__).resolve().parent))     # the sounds packed into the app; silent if there are none
+        shield_sound.install(self.sounds)
+        self.scroll_feel = ScrollFeel(self.sounds)
+        self._apply_feel()
         self.events = Events()
         self.store = Store()
         self.prot = Protection()
@@ -697,8 +754,24 @@ class Core(QObject):
             ev.set()
 
     # ------------------------------------------------------------------ settings and data
+    def _apply_feel(self):
+        c = self.cfg
+        shield_fx.set_enabled(c["fluid_motion"])
+        self.sounds.configure(c["sound_effects"], c["sound_volume"] / 100.0, c["scroll_sound"])
+
+    def _smooth_scroll(self):
+        """Animated scrolling in the web engine (off by default in Qt): wheel, keys and trackpad glide instead of jumping."""
+        A = QWebEngineSettings.WebAttribute
+        if hasattr(A, "ScrollAnimatorEnabled"):
+            self.profile.settings().setAttribute(A.ScrollAnimatorEnabled, bool(self.cfg["fluid_motion"]))
+
     def on_setting(self, key):
-        if key == "theme":
+        if key in ("fluid_motion", "sound_effects", "sound_volume", "scroll_sound"):
+            self._apply_feel()
+            self._smooth_scroll()
+            if key in ("sound_effects", "sound_volume"):
+                self.sounds.play("click")            # a preview, so the new volume can be judged
+        elif key == "theme":
             self.apply_theme()
         elif key in ("fingerprint_protection", "fingerprint_level", "vault_autofill", "vault_offer_save"):
             self.rebuild_scripts()
@@ -774,6 +847,7 @@ class Core(QObject):
             if hasattr(A, name):
                 p.settings().setAttribute(getattr(A, name), val)
 
+        self._smooth_scroll()
         self._default_ua = p.httpUserAgent()
         m = re.search(r"Chrome/([\d.]+)", self._default_ua)
         self.ctx.engine = {"chromium": m.group(1) if m else "unknown", "flags": " ".join(_FLAGS),
@@ -817,6 +891,14 @@ class Core(QObject):
         except Exception:
             pass
         dark = self.is_dark()
+        shots = []
+        if fx_on() and dark != T.dark:           # remember how each window looked, so the new colours can spread over it
+            for w in list(self.windows):
+                try:
+                    if w.isVisible() and not w.isMinimized():
+                        shots.append((w, w.root.grab()))
+                except RuntimeError:
+                    pass
         T.set_dark(dark)
         p = QPalette()
         R = QPalette.ColorRole
@@ -827,6 +909,13 @@ class Core(QObject):
         p.setColor(R.HighlightedText, QColor("#ffffff"))
         app.setPalette(p)
         app.setStyleSheet(stylesheet())
+        for w, pm in shots:
+            try:
+                w.theme_drop(pm)
+            except RuntimeError:
+                pass
+        if shots:
+            play_sound("theme")
 
     def is_dark(self):
         t = self.cfg["theme"]
@@ -891,6 +980,8 @@ class Core(QObject):
     def _dl_state(self, state, did, path, name, url, mime):
         S = QWebEngineDownloadRequest.DownloadState
         if state == S.DownloadCompleted:
+            self._each(lambda w: (w.dl_btn.pulse(), w.dl_btn.bounce()))
+            play_sound("download")
             self.active_dl.pop(did, None)
             lock_down(path, url)
             self.store.update_download(did, state="scanning", path=str(path))
@@ -1488,11 +1579,14 @@ class Browser(QMainWindow):
         self._printer = None
         self._sheet, self._sheet_q = None, []
         self._tick_n = 0
+        self._live = False                      # becomes True once the window is up: tabs restored at start stay quiet
+        self._shield_site, self._shield_n = None, 0
         self._build_ui()
         self._open_tabs(urls, restore, empty)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(700)
+        self._live = True
         QApplication.instance().focusChanged.connect(self._focus_moved)
 
     def __getattr__(self, name):
@@ -1629,6 +1723,77 @@ class Browser(QMainWindow):
         self.split_pair = (b, a)
         self.strip.set_pair(b, a)
         self.stack.swap()
+
+    # ------------------------------------------------------------------ private connection
+    def toggle_proxy(self):
+        if PROXY is None:
+            return
+        PROXY.toggle()
+        self._proxy_sync()
+
+    def proxy_menu(self, pos):
+        if PROXY is None:
+            return
+        st = PROXY.state()["name"]
+        m = soften_menu(QMenu(self))
+        a = m.addAction("Turn off" if PROXY.want else "Turn on")
+        a.triggered.connect(self.toggle_proxy)
+        n = m.addAction("New identity (fresh route)")
+        n.setEnabled(st == "on")
+        n.triggered.connect(lambda: (PROXY.new_identity(), self.toast("New route: sites you open next can't be linked to the ones before")))
+        m.addSeparator()
+        boot = m.addAction("On when Shield opens")
+        boot.setCheckable(True)
+        boot.setChecked(bool(self.cfg["proxy_on_start"]))
+        boot.triggered.connect(lambda on: self.cfg.set("proxy_on_start", "1" if on else "0"))
+        m.exec(self.proxy_btn.mapToGlobal(pos))
+
+    def _proxy_sync(self):
+        """Keep the globe button and its messages in step with the connection. Runs a couple of times a second."""
+        if PROXY is None:
+            return
+        s = PROXY.state()
+        name, pct, msg = s["name"], s["pct"], s["message"].strip()
+        if msg and msg[-1] not in ".!?":
+            msg += "."
+        label = PROXY.LABEL.get(s.get("transport", ""), "")
+        via = f" via {label}" if label else ""
+        self.proxy_btn.set_tone({"on": "acc", "connecting": "warn", "failed": "bad"}.get(name))
+        self.proxy_btn.setToolTip({
+            "off": "Private connection: off. Click to hide the sites you visit from your network and internet provider.",
+            "connecting": f"{msg} {pct}%. Pages wait until it is ready, so nothing goes out unprotected.",
+            "on": f"Private connection: on{via}. Your network sees Tor, not the sites you visit. Click to turn off, right-click for more.",
+            "failed": f"{msg} Pages stay paused so nothing goes out unprotected. Click to turn it off.",
+            "unavailable": msg,
+        }[name])
+        tr = s.get("transport", "")
+        if name == "connecting" and tr not in ("", "direct") and tr != self._proxy_tr:
+            self._proxy_tr = tr         # the normal route didn't work, so Shield moved on by itself
+            self.toast(f"This network may be blocking Tor. Trying {label}.")
+        if name in ("off", "unavailable"):
+            self._proxy_tr = ""
+        if name != self._proxy_name:
+            prev, self._proxy_name = self._proxy_name, name
+            note = {"on": f"Private connection on{via}. Your network can no longer see which sites you visit.",
+                    "connecting": "Connecting privately. Pages wait until it is ready.",
+                    "failed": msg + " Pages are paused. Click the globe to turn it off.",
+                    "unavailable": msg}.get(name)
+            if name == "off" and prev in ("on", "connecting", "failed"):
+                note = "Private connection off. Browsing is direct again."
+            if self.isActiveWindow():
+                if name == "on":
+                    self.proxy_btn.pulse(3)
+                    play_sound("connect")
+                elif name == "connecting":
+                    self.proxy_btn.pulse(1)
+                    play_sound("toggle")
+                elif name == "failed":
+                    self.proxy_btn.shake()
+                    play_sound("error")
+                elif name == "off" and prev in ("on", "connecting", "failed"):
+                    play_sound("toggle")
+            if note:
+                self.toast(note)
 
     def _refresh_split_ui(self):
         on = self.split_pair is not None
@@ -1873,7 +2038,13 @@ class Browser(QMainWindow):
         self.menu_btn.clicked.connect(self.show_menu)
         self.split_btn = IconButton("split", "Split view (Ctrl+\\)")
         self.split_btn.clicked.connect(self.split_clicked)
-        for b in (self.vault_btn, self.shield_btn, self.dl_btn, self.split_btn, self.menu_btn):
+        self.proxy_btn = IconButton("globe", "Private connection: off")
+        self.proxy_btn.clicked.connect(self.toggle_proxy)
+        self.proxy_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.proxy_btn.customContextMenuRequested.connect(self.proxy_menu)
+        self.proxy_btn.setVisible(PROXY is not None)
+        self._proxy_name, self._proxy_tr = "off", ""
+        for b in (self.vault_btn, self.shield_btn, self.dl_btn, self.proxy_btn, self.split_btn, self.menu_btn):
             bl.addWidget(b)
         self.vault_btn.setVisible(self.cfg["vault_autofill"] or self.vault.exists())
         cv.addWidget(bar)
@@ -1891,6 +2062,7 @@ class Browser(QMainWindow):
         self.findbar.step.connect(self._find_step)
         self.findbar.closed.connect(lambda: self.cur() and self.cur().findText(""))
         self.tabcard = TabCard(self.root)
+        self.drop_fx = DropReveal(self.root)      # the drop that turns the whole window dark or light
         self.tabsearch = TabSearch(self.root)
         self.tabsearch.chosen.connect(self._search_chosen)
         self.root.resized.connect(self._place_overlays)
@@ -1993,6 +2165,8 @@ class Browser(QMainWindow):
         self._wire(view)
         if not background:
             self._select(view)
+            if self._live:
+                play_sound("tab_new")
         if url:
             view.setUrl(url)
         return view
@@ -2023,15 +2197,32 @@ class Browser(QMainWindow):
                 pass
         view._links = []
 
+    def _drop_origin(self, view):
+        """Where the page falls out of: straight below the tab it belongs to (a tab still growing counts as where it will end up)."""
+        t = self.strip._find(view)
+        if t is None or not self._live:
+            return None
+        cx = (t.tx + t.tw / 2.0) if t.w < t.tw * 0.6 else (t.x + t.w / 2.0)
+        g = self.strip.mapToGlobal(QPoint(int(round(cx)), 0))
+        return QPointF(float(self.stack.mapFromGlobal(g).x()), 0.0)
+
+    def theme_drop(self, pm):
+        """Dark and light change as a drop that spreads from the pointer (or the middle of the toolbar if it is elsewhere)."""
+        pos = self.root.mapFromGlobal(QCursor.pos())
+        if not self.root.rect().contains(pos):
+            pos = QPoint(self.root.width() // 2, self.chrome.height() // 2)
+        self.drop_fx.play(pm if usable_grab(pm) else None, QPointF(pos), T.c("acc"), T.c("window"), T.dark)
+
     def _select(self, view):
         if view is None:
             return
+        origin = self._drop_origin(view)
         self.strip.set_current(view)
         pair = self.split_pair
         if pair and any(view is x for x in pair):
             self.stack.show_split(pair[0], pair[1], view)
         else:
-            self.stack.show_single(view)
+            self.stack.show_single(view, origin=origin)
         self.chrome.progress.hide()
         self._sync()
         if self.findbar.isVisible():
@@ -2046,6 +2237,8 @@ class Browser(QMainWindow):
         if self.strip.count() <= 1:
             self.close()
             return
+        if self._live:
+            play_sound("tab_close")
         views = self.strip.views()
         i = views.index(view)
         was_current = view is self.cur()
@@ -2203,9 +2396,14 @@ class Browser(QMainWindow):
         self.setWindowTitle(f"{t} \u2013 Shield" if t else "Shield")
 
     def _tick(self):
+        self._proxy_sync()
         v = self.cur()
         if v:
-            n = self.events.site_count(site_of(v.url().host()))
+            site = site_of(v.url().host())
+            n = self.events.site_count(site)
+            if site == self._shield_site and n > self._shield_n and self.isActiveWindow():
+                self.shield_btn.glint()               # the shield just caught something on this page
+            self._shield_site, self._shield_n = site, n
             self.shield_btn.set_badge(f"{n}" if n else "", "ok")
             self.shield_btn.set_tone("ok" if n else None)
             self.omni.zoom.set_zoom(v.zoomFactor())
@@ -2250,6 +2448,9 @@ class Browser(QMainWindow):
         if u.scheme() in ("http", "https"):
             on = self.store.toggle_bookmark(u.toString(), self.cur().title())
             self.toast("Bookmark added" if on else "Bookmark removed")
+            if on:
+                self.omni.star.burst()
+                play_sound("star")
             self.refresh_completer()
             self._sync()
 
@@ -2438,23 +2639,38 @@ class Browser(QMainWindow):
             act, text = res if isinstance(res, tuple) else (res, "")
             if act != "unlock":
                 return
+            sheet = self._sheet          # the card stays open while the answer is checked, then answers like Face ID
+
+            def answer(result, message=""):
+                try:
+                    if sheet is not None:
+                        sheet.resolve(result, message)
+                except RuntimeError:
+                    pass
             if v.wait_seconds():
+                answer(None)
                 self.toast(f"Too many tries. Wait {v.wait_seconds()} seconds.")
                 return
             try:
                 ok = v.unlock(text)
             except shield_vault.VaultError as e:
+                answer(None)
                 self.toast(str(e))
                 return
+            except Exception:
+                answer(None)
+                raise
             if ok:
                 self._vault_ui()
+                self.vault_btn.glint()
+                answer(True)
                 if after:
                     after()
             else:
-                self.unlock_prompt(after, "That isn't the master password. Try again.")
+                answer(False, "That isn't the master password. Try again.")
         self.ask(done, icon="lock", tone="acc", title="Unlock your vault", body=error or "Enter your master password.",
                  buttons=[("Unlock", "pri", "unlock"), ("Cancel", "plain", "cancel")], cancel="cancel",
-                 field={"placeholder": "Master password", "password": True})
+                 field={"placeholder": "Master password", "password": True}, hold=("unlock",))
 
     def key_menu(self):
         v, view = self.vault, self.cur()
@@ -2818,6 +3034,11 @@ def main():
     if sys.platform == "darwin":
         app._open_events = _OpenEvents(core)
         app.installEventFilter(app._open_events)
+    if PROXY is not None:
+        PROXY.settings = lambda: (core.cfg["proxy_bridge_mode"], core.cfg["proxy_bridges"])
+        app.aboutToQuit.connect(PROXY.shutdown)          # Tor never outlives the browser
+        if core.cfg["proxy_on_start"] and PROXY.available():
+            PROXY.enable()
     core.start(urls)
     QTimer.singleShot(0, core.focus_active)
     sys.exit(app.exec())
