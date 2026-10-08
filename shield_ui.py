@@ -13,7 +13,7 @@ import re
 import time
 
 from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient
+from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QAbstractButton, QApplication, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit,
@@ -22,9 +22,7 @@ from PyQt6.QtWidgets import (
 
 from shield_core import site_of
 from shield_icons import svg_doc
-from shield_fx import DropReveal, Ripples, ease_in_out, ease_out, fx_on, shake_offset
-from shield_motion import Spring, Ticker, FrameClock, clamp01, iround, smoothstep, snap_rect, spring_step, window
-from shield_sound import play as play_sound
+from shield_motion import Spring, Ticker, FrameClock, iround, snap_rect, spring_step, window
 
 
 # --------------------------------------------------------------------------
@@ -274,95 +272,6 @@ class IconButton(QAbstractButton):
         self.pressed.connect(lambda: self._g_pr.to(1.0))
         self.released.connect(lambda: self._g_pr.to(0.0))
         T.changed.connect(self.update)
-        # the extra life: a ripple where it is pressed, and four things the program can ask for (pulse, burst, glint, shake)
-        self.silent = False                       # True: pressing makes no click sound (the caller plays a better one)
-        self._rip = Ripples(self)
-        self._rings, self._burst, self._glint, self._shake = [], None, None, None
-        self._pop = Spring(0.0, 17.0, 0.36, 0.003)       # the icon's little jump: kicked, then it springs back with a wobble
-        self._fx_run = self._fx_step
-
-    # -- extra life ---------------------------------------------------------------
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self.isEnabled():
-            if not self.silent:
-                play_sound("click")
-            if fx_on():
-                self._rip.add(e.position().x(), e.position().y())
-        super().mousePressEvent(e)
-
-    def pulse(self, rings=2):
-        """Rings spread out from the icon like a drop landing in water. For something that just turned on or arrived."""
-        if fx_on():
-            self._rings += [-0.17 * i for i in range(rings)]      # a negative age means "not started yet"
-            FrameClock.get().add(self._fx_run)
-
-    def burst(self):
-        """The icon jumps and throws off sparks. For a small celebration (a bookmark saved)."""
-        if fx_on():
-            self._burst = 0.0
-            self._pop.x, self._pop.v = 0.0, 15.0
-            FrameClock.get().add(self._fx_run)
-
-    def glint(self):
-        """A band of light sweeps across the icon once."""
-        if fx_on():
-            self._glint = 0.0
-            FrameClock.get().add(self._fx_run)
-
-    def shake(self):
-        """The icon shakes side to side: no."""
-        if fx_on():
-            self._shake = 0.0
-            FrameClock.get().add(self._fx_run)
-
-    def bounce(self):
-        """The icon drops a little and bounces: it arrived."""
-        if fx_on():
-            self._pop.x, self._pop.v = -0.30, 0.0
-            FrameClock.get().add(self._fx_run)
-
-    def _fx_step(self, dt):
-        busy = self._pop.step(dt)
-        self._rings = [a + dt for a in self._rings if a + dt < 0.72]
-        if self._rings:
-            busy = True
-        if self._burst is not None:
-            self._burst += dt
-            if self._burst > 0.6:
-                self._burst = None
-            else:
-                busy = True
-        if self._glint is not None:
-            self._glint += dt
-            if self._glint > 0.7:
-                self._glint = None
-            else:
-                busy = True
-        if self._shake is not None:
-            self._shake += dt
-            if self._shake > 0.6:
-                self._shake = None
-            else:
-                busy = True
-        self.update()
-        return busy
-
-    def _paint_glint(self, p, box):
-        dpr = p.device().devicePixelRatioF() if hasattr(p.device(), "devicePixelRatioF") else 2.0
-        size = int(round(box.width()))
-        tint = QColor(255, 255, 255) if T.dark else QColor(T.c("acc"))
-        lit = QPixmap(pix(self._name, tint, size, max(1.0, dpr)))      # a copy: the cached one stays untouched
-        c = -0.3 + 1.6 * ease_in_out(self._glint / 0.62)
-        w, side = 0.3, float(size)
-        g = QLinearGradient(QPointF(side * (c - w), side * (c - w)), QPointF(side * (c + w), side * (c + w)))
-        g.setColorAt(0.0, QColor(255, 255, 255, 0))
-        g.setColorAt(0.5, QColor(255, 255, 255, 240))
-        g.setColorAt(1.0, QColor(255, 255, 255, 0))
-        q = QPainter(lit)
-        q.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
-        q.fillRect(QRectF(0, 0, side, side), QBrush(g))
-        q.end()
-        p.drawPixmap(QPointF(box.x(), box.y()), lit)
 
     def _set_hv(self, v):
         self._hv = v
@@ -429,43 +338,14 @@ class IconButton(QAbstractButton):
         base = T.c(self._tone) if self._tone else T.mix("mut", "text", self._hv)
         if not on:
             base = T.c("faint", .55)
-        if self._rip.items:
-            self._rip.paint(p, r.adjusted(1, 1, -1, -1), 9, T.c(self._tone) if self._tone else T.c("text"), r.width() * 0.62)
-        s = self._icon * (1.0 - 0.1 * self._pr) * (1.0 + 0.32 * self._pop.x)
-        dx = shake_offset(self._shake, 3.4, 8.0, 7.0) if self._shake is not None else 0.0
-        box = QRectF(r.center().x() - s / 2 + dx, r.center().y() - s / 2, s, s)
+        s = self._icon * (1.0 - 0.1 * self._pr)
+        box = QRectF(r.center().x() - s / 2, r.center().y() - s / 2, s, s)
         if self._prev is not None:
             draw_icon(p, self._prev, box, base, 1.0 - self._xf)
             rot = box.translated(0, (1 - self._xf) * 2.5)
             draw_icon(p, self._name, rot, base, self._xf)
         else:
             draw_icon(p, self._name, box, base)
-        if self._glint is not None:
-            self._paint_glint(p, box)
-        if self._rings or self._burst is not None:
-            fxc = T.c(self._tone) if self._tone else T.c("acc")
-            c0 = r.center()
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            for a in self._rings:
-                if a < 0:
-                    continue
-                u = clamp01(a / 0.72)
-                col = QColor(fxc)
-                col.setAlphaF(0.6 * (1.0 - u) ** 1.3)
-                p.setPen(QPen(col, 1.9 * (1.0 - u) + 0.5))
-                rad = self._icon * 0.45 + (r.width() / 2.0 - 1.0 - self._icon * 0.45) * ease_out(u)
-                p.drawEllipse(c0, rad, rad)
-            if self._burst is not None:
-                u = clamp01(self._burst / 0.55)
-                p.setPen(Qt.PenStyle.NoPen)
-                for k in range(8):
-                    ang = k * math.pi / 4 + 0.2
-                    dist = self._icon * (0.38 + 0.36 * ease_out(u))
-                    rad = (2.1 if k % 2 == 0 else 1.4) * (1.0 - u) ** 0.8 + 0.15
-                    col = QColor(fxc)
-                    col.setAlphaF(max(0.0, 1.0 - u * u))
-                    p.setBrush(col)
-                    p.drawEllipse(QPointF(c0.x() + math.cos(ang) * dist, c0.y() + math.sin(ang) * dist), rad, rad)
         if self._badge:
             f = ui_font(7.2, QFont.Weight.Bold)
             fm = QFontMetricsF(f)
@@ -668,7 +548,6 @@ class Omnibox(QFrame):
         lay.addWidget(self.star)
         self._g_hv = Glide(self, self._sh, 14)
         self._g_fc = Glide(self, self._sf, 16)
-        self._sw, self._sw_run = 1.0, self._sw_step           # the sweep of light: 0..1, and 1 means finished
         self.edit.focused.connect(self._on_focus)
         self.label.clicked.connect(self.focus_edit)
         self.edit.textChanged.connect(lambda *_: None)
@@ -703,51 +582,8 @@ class Omnibox(QFrame):
         self.edit.setFocus(Qt.FocusReason.MouseFocusReason)
         self.edit.selectAll()
 
-    def _sw_step(self, dt):
-        self._sw = min(1.0, self._sw + dt / 0.85)
-        self.update()
-        return self._sw < 1.0
-
-    def _paint_sweep(self, p, q):
-        """Two points of light leave the left end of the field, run along the top and the bottom with a fading tail, and meet
-        at the right end. Positions are measured along the outline itself, so the light moves at an even speed."""
-        R = q.height() / 2.0
-        cy, x0, x1 = q.center().y(), q.left(), q.right()
-        flat = max(0.0, q.width() - 2.0 * R)
-        quarter = math.pi * R / 2.0
-        total = 2.0 * quarter + flat
-
-        def at(s, side):
-            if s <= quarter:
-                th = math.pi - s / R
-                return QPointF(x0 + R + R * math.cos(th), cy + side * R * math.sin(th))
-            if s <= quarter + flat:
-                return QPointF(x0 + R + (s - quarter), cy + side * R)
-            th = math.pi / 2.0 - (s - quarter - flat) / R
-            return QPointF(x1 - R + R * math.cos(th), cy + side * R * math.sin(th))
-
-        tail = min(total * 0.6, 260.0)
-        head = ease_in_out(self._sw) * (total + tail)
-        lo, hi = max(0.0, head - tail), min(total, head)
-        if hi - lo < 1.0:
-            return
-        fade = 1.0 - smoothstep((self._sw - 0.7) / 0.3)
-        col = QColor(T.c("acc")).lighter(185 if T.dark else 120)
-        n = 36
-        for width, weight in ((8.0, 0.20), (3.0, 1.0)):          # a soft glow underneath, a bright core on top
-            for side in (-1.0, 1.0):
-                for i in range(n):
-                    a = lo + (hi - lo) * i / n
-                    b = lo + (hi - lo) * (i + 1) / n
-                    col.setAlphaF(max(0.0, min(1.0, ((i + 1) / n) ** 1.7 * fade * weight)))
-                    p.setPen(QPen(col, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
-                    p.drawLine(at(a, side), at(b, side))
-
     def _on_focus(self, on):
         self._g_fc.to(1.0 if on else 0.0)
-        if on and fx_on():
-            self._sw = 0.0
-            FrameClock.get().add(self._sw_run)
         if not on:
             self.edit.setText(self._current)
             self._show_label()
@@ -778,11 +614,8 @@ class Omnibox(QFrame):
         p.drawRoundedRect(r, 17, 17)
         if self._fc > 0.01:
             p.setBrush(Qt.BrushStyle.NoBrush)
-            ring = self._fc * .85 * (0.28 + 0.72 * smoothstep(self._sw * 1.1))      # while the light runs, the ring fills in behind it
-            p.setPen(QPen(T.c("acc", ring), 2))
+            p.setPen(QPen(T.c("acc", self._fc * .85), 2))
             p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 16, 16)
-        if self._sw < 1.0:
-            self._paint_sweep(p, r.adjusted(1, 1, -1, -1))
 
 
 # --------------------------------------------------------------------------
@@ -842,34 +675,9 @@ class ProgressLine(QWidget):
         if self._val <= 0:
             return
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        h = float(self.height())
         w = self.width() * min(1.0, self._val)
         a = T.c("acc", self._alpha)
-        p.fillRect(QRectF(0, h - 2, w, 2), a)
-        if fx_on() and w > 6 and self._alpha > 0.02:
-            # the bar brightens toward its tip, and the tip blooms into the toolbar above it like a comet
-            trail = min(w, 170.0)
-            head = QColor(T.c("acc")).lighter(145)
-            head.setAlphaF(min(1.0, self._alpha))
-            tail = T.c("acc", 0.0)
-            g = QLinearGradient(w - trail, 0, w, 0)
-            g.setColorAt(0.0, tail)
-            g.setColorAt(1.0, head)
-            p.fillRect(QRectF(w - trail, h - 2, trail, 2), QBrush(g))
-            p.save()
-            p.translate(w, h - 1.0)
-            p.scale(1.0, 0.3)
-            bloom = QRadialGradient(QPointF(0, 0), 34.0)
-            glow = QColor(T.c("acc"))
-            glow.setAlphaF(0.5 * min(1.0, self._alpha))
-            bloom.setColorAt(0.0, glow)
-            glow.setAlphaF(0.0)
-            bloom.setColorAt(1.0, glow)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(bloom))
-            p.drawEllipse(QPointF(0, 0), 34.0, 34.0)
-            p.restore()
+        p.fillRect(QRectF(0, 0, w, self.height()), a)
 
 
 # --------------------------------------------------------------------------
@@ -877,7 +685,7 @@ class ProgressLine(QWidget):
 # --------------------------------------------------------------------------
 class _Tab:
     __slots__ = ("view", "title", "icon", "loading", "x", "w", "tx", "tw", "hv", "cx", "pinned", "audio", "mate", "pa", "vx", "vw",
-                 "vh", "vc", "vp", "cxt", "pk", "vpk", "rip")
+                 "vh", "vc", "vp", "cxt")
 
     def __init__(self, view, title):
         self.view, self.title, self.icon, self.loading = view, title, None, False
@@ -890,8 +698,6 @@ class _Tab:
         self.vh = self.vc = self.vp = 0.0      # velocities of hv, cx, pa
         self.mate = None   # the other tab of a split view (a _Tab), if this one is paired
         self.pa = 0.0      # how strongly the pair's capsule shows, eased
-        self.pk = self.vpk = 0.0     # the tab's squish when it is chosen: pressed in, then it springs back out with a wobble
-        self.rip = None              # water ripples from where it was pressed (made when first needed)
 
 
 class DragGhost(QWidget):
@@ -998,7 +804,6 @@ class TabStrip(QWidget):
         self._tm = Ticker(self._tick)
         self.plus = IconButton("plus", "New tab (Ctrl+T)", 30, 17, self)
         self.plus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.plus.silent = True                 # opening a tab has its own sound
         self.plus.clicked.connect(self.newRequested)
         self.search = IconButton("chevron-down", "Search tabs (Ctrl+Shift+A)", 30, 16, self)
         self.search.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1227,12 +1032,6 @@ class TabStrip(QWidget):
                 t.cx, t.vc = t.cxt, 0.0
             else:
                 busy = True
-            if t.pk or t.vpk:
-                t.pk, t.vpk = spring_step(t.pk, t.vpk, 0.0, 24.0, 0.42, dt)
-                if abs(t.pk) < .003 and abs(t.vpk) < .06:
-                    t.pk = t.vpk = 0.0
-                else:
-                    busy = True
             want = 0.0 if t.mate is None else (1.0 if (t is cur_item or t.mate is cur_item) else .55)
             t.pa, t.vp = spring_step(t.pa, t.vp, want, 21.0, 1.0, dt)
             if abs(t.pa - want) < .004 and abs(t.vp) < .05:
@@ -1359,19 +1158,7 @@ class TabStrip(QWidget):
         for t in self.items:
             if t is not self._drag:
                 grow = window(t.w / t.tw, 0.12, 0.6) if 0 < t.tw and t.w < t.tw else 1.0
-                squish = t.pk != 0.0 and t.w > 20
-                if squish:
-                    p.save()
-                    c = QPointF(t.x + t.w / 2.0, self.H / 2.0)
-                    p.translate(c)
-                    k = 1.0 + 0.05 * t.pk
-                    p.scale(k, 1.0 + 0.09 * t.pk)
-                    p.translate(-c)
                 self._paint_tab(p, t.x, t.w, t.title, t.icon, t.loading, t.view is self.cur, t.hv, t.cx, 1.0, True, t.pinned, t.audio, ca=grow)
-                if t.rip is not None and t.rip.items:
-                    t.rip.paint(p, QRectF(t.x, 5, t.w, self.H - 10), 9, T.c("text"), max(60.0, t.w * 0.75))
-                if squish:
-                    p.restore()
         if self._drag and not self._lifted:
             t = self._drag
             self._paint_tab(p, t.x, t.w, t.title, t.icon, t.loading, True, 1.0, t.cx, 1.0, True, t.pinned, t.audio)
@@ -1388,9 +1175,6 @@ class TabStrip(QWidget):
     def _select(self, t):
         if t.view is not self.cur:
             self.cur = t.view
-            if fx_on():
-                t.pk, t.vpk = -1.0, 0.0
-            play_sound("tab_select")
             self._kick()
             self.update()
             self.currentChanged.emit(t.view)
@@ -1407,10 +1191,6 @@ class TabStrip(QWidget):
             on_audio = bool(ar and ar.contains(e.position()))
             self._press = (t, e.position(), "audio" if on_audio else on_close)
             if not on_close and not on_audio:
-                if fx_on():
-                    if t.rip is None:
-                        t.rip = Ripples(self)
-                    t.rip.add(e.position().x(), e.position().y())
                 self._select(t)
         elif e.button() == Qt.MouseButton.MiddleButton:
             self._press = (t, e.position(), "middle")
@@ -1605,7 +1385,7 @@ class Chrome(QWidget):
         T.changed.connect(self.update)
 
     def resizeEvent(self, e):
-        self.progress.setGeometry(0, self.height() - 9, self.width(), 9)     # the bar is its bottom 2 px; the rest is room for its glow
+        self.progress.setGeometry(0, self.height() - 2, self.width(), 2)
         super().resizeEvent(e)
 
     def paintEvent(self, _):
@@ -1820,9 +1600,6 @@ def _usable(pm):
     return bool(seen) and seen != {0xff000000}
 
 
-usable_grab = _usable
-
-
 class _Pane:
     __slots__ = ("view", "clip", "snap", "s", "size", "anchor", "leaving", "live", "w0")
 
@@ -1841,6 +1618,106 @@ class _Pane:
 
     def rect(self):
         return QRectF(self.s[0].x, self.s[1].x, self.s[2].x, self.s[3].x)
+
+
+class _Bloom(QWidget):
+    """A page arriving out of its tab, like a drop landing on water.
+
+    It is one spring (kicked, so it shoots out at once and then settles softly) that drives everything together:
+      * the page opens as a card from the tab's own footprint. It spreads sideways first and then falls, which is what
+        gives it the liquid, stretched-then-settled shape, and its corners straighten as it fills the window;
+      * the tab you left stays underneath, easing back and dimming a little, so the new page reads as coming forward;
+      * two soft rings travel out from the tab across the page, one a beat behind the other;
+      * the card is a stretched picture of the page as it was last seen, and dissolves into the live page at the end.
+    The live page is already in place underneath the whole time; this only covers it, so it costs the engine nothing."""
+    OMEGA, ZETA, KICK = 12.0, 0.86, 1.2
+
+    def __init__(self, host):
+        super().__init__(host)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.back = self.card = None
+        self.o = QRectF()
+        self.x = self.v = 0.0
+        self._tm = Ticker(self._step)
+        self.hide()
+
+    def play(self, back, card, origin):
+        self.back, self.card, self.o = back, card, QRectF(origin)
+        self.x, self.v = 0.0, self.KICK
+        self.setGeometry(self.parentWidget().rect())
+        self.show()
+        self.raise_()
+        self._tm.start()
+
+    def stop(self):
+        self._tm.stop()
+        if self.isVisible():
+            self.hide()
+        self.back = self.card = None
+
+    def _step(self, dt):
+        self.x, self.v = spring_step(self.x, self.v, 1.0, self.OMEGA, self.ZETA, dt)
+        if self.x >= 0.9995:
+            self.stop()
+            return False
+        self.update()
+        return True
+
+    def paintEvent(self, _):
+        if self.o.isEmpty():
+            return
+        W, H = float(self.width()), float(self.height())
+        pr = max(0.0, min(1.0, self.x))
+        pw = 1.0 - (1.0 - pr) ** 2.4                    # spreads sideways first...
+        ph = pr ** 1.35                                  # ...then falls
+        o = self.o
+        r = QRectF(lerp(o.x(), 0.0, pw), lerp(o.y(), 0.0, ph), lerp(o.width(), W, pw), lerp(o.height(), H, ph))
+        rad = lerp(16.0, 0.0, window(pr, 0.3, 1.0))
+        op = 1.0 - window(pr, 0.8, 0.985)                # the whole effect dissolves into the live page just before it lands
+        if op <= 0.002:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.setOpacity(op)
+        full = QRectF(0, 0, W, H)
+        # the page you left, easing back
+        p.fillRect(full, T.c("window"))
+        sc = 1.0 - 0.045 * window(pr, 0.0, 1.0)
+        br = QRectF(W * (1 - sc) / 2.0, H * (1 - sc) / 2.0, W * sc, H * sc)
+        if self.back is not None:
+            p.drawPixmap(br, self.back, QRectF(self.back.rect()))
+        p.fillRect(full, QColor(0, 0, 0, int(72 * window(pr, 0.0, 0.7))))
+        # the card's shadow, then the card
+        p.setPen(Qt.PenStyle.NoPen)
+        for grow, a in ((24.0, 9), (13.0, 14), (5.0, 20)):
+            p.setBrush(QColor(0, 0, 0, int(a * (1.0 - 0.5 * pr))))
+            p.drawRoundedRect(r.adjusted(-grow * 0.5, -grow * 0.2, grow * 0.5, grow * 0.8), rad + grow * 0.5, rad + grow * 0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, rad, rad)
+        p.save()
+        p.setClipPath(path)
+        p.fillRect(r, T.c("card"))
+        if self.card is not None:
+            p.setOpacity(op * window(pr, 0.02, 0.45))
+            p.drawPixmap(r, self.card, QRectF(self.card.rect()))
+        else:
+            p.setOpacity(op * window(pr, 0.08, 0.4) * (1.0 - window(pr, 0.6, 0.95)))
+            c = r.center()
+            draw_icon(p, "shield", QRectF(c.x() - 16, c.y() - 16, 32, 32), T.c("faint"))
+        p.restore()
+        p.setOpacity(op)
+        p.setPen(QPen(T.c("acc", 0.5 * (1.0 - window(pr, 0.2, 0.9))), 1.4))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(r, rad, rad)
+        # two rings travelling out from the tab
+        c = o.center()
+        maxr = math.hypot(W, H) * 0.62
+        for delay, strength in ((0.0, 0.34), (0.16, 0.2)):
+            e = window(pr, delay, 1.0)
+            if 0.002 < e < 0.998:
+                p.setPen(QPen(T.c("acc", strength * (1.0 - e) ** 1.6), 2.4 * (1.0 - e) + 0.6))
+                p.drawEllipse(c, maxr * e, maxr * e * 0.5)
 
 
 class ViewHost(QWidget):
@@ -1875,7 +1752,8 @@ class ViewHost(QWidget):
         self._hv, self._drag = 0.0, False
         self._g_hv = Glide(self, self._sh, 16)
         self._tm = Ticker(self._tick)
-        self._drop = DropReveal(self)       # the water drop that carries one page over another (see shield_fx.py)
+        self._bloom = _Bloom(self)
+        self._shots = {}                 # view -> a half-size picture of it from the last time it was on screen
         T.changed.connect(self.update)
 
     # -- the small part of QStackedWidget the window uses ---------------------
@@ -1891,6 +1769,7 @@ class ViewHost(QWidget):
         if view in self._views:
             self._views.remove(view)
         p = self._p.pop(view, None)
+        self._shots.pop(view, None)
         if self._pair and view in self._pair:
             self._pair = None
         if self._active is view:
@@ -1991,8 +1870,25 @@ class ViewHost(QWidget):
             p.snap.show()
             p.snap.raise_()
 
+    def _grab(self, view):
+        """A half-size picture of a page, or the last good one if the engine can't be captured right now."""
+        p = self._p.get(view)
+        if p is not None and self.isVisible() and p.clip.isVisibleTo(self):
+            try:
+                pm = p.clip.grab()
+                if pm is not None and not pm.isNull():
+                    pm = pm.scaled(max(1, pm.width() // 2), max(1, pm.height() // 2),
+                                   Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            except Exception:
+                pm = None
+            if _usable(pm):
+                self._shots[view] = pm
+                return pm
+        return self._shots.get(view)
+
     def _snap(self, goal):
         """Put every pane exactly where it belongs, right now."""
+        self._bloom.stop()
         self._tm.stop()
         for v in self._views:
             if v not in goal:
@@ -2014,6 +1910,7 @@ class ViewHost(QWidget):
         starts: where a pane that is just arriving begins. leaving: panes that shrink away and are hidden when they land
         (they keep their page size, so nothing re-lays-out while they go). anchors: the edge of its frame a page is pinned to for arriving and leaving panes."""
         anchors, starts = anchors or {}, starts or {}
+        self._bloom.stop()
         for v in self._views:
             if v not in goals:
                 self._hide(v)
@@ -2056,23 +1953,18 @@ class ViewHost(QWidget):
         self._tm.start()
         self.update()
 
-    def _capture(self):
-        """A picture of what the host shows right now, or None if the web engine could not be captured."""
-        pm = self.grab()
-        return pm if _usable(pm) else None
-
     def show_single(self, view, animate=False, origin=None):
         """Show one page. If it was one half of a split and animate is set, the other half slides away.
 
-        origin: where the drop lands, as an x position along the top edge in this widget's coordinates. When given, the new
-        page falls out of that spot like a drop of water and spreads over the old one (the live new page is already
-        underneath; only a picture of the old one is being cut away, so nothing is laid out twice)."""
+        origin: where the page should grow out of (a rectangle in this widget's coordinates, normally the tab's footprint).
+        Returns True if it did that."""
         prev = self._pair
-        shot = False
-        if (origin is not None and fx_on() and prev is None and self.isVisible() and self.width() > 80 and self.height() > 80
-                and self._active is not None and self._active is not view and self._active in self._p
-                and self._p[self._active].clip.isVisibleTo(self)):
-            shot = self._capture()          # taken BEFORE anything changes
+        old = self._active
+        back = None
+        bloom = (origin is not None and prev is None and old is not None and old is not view and view in self._p
+                 and self.isVisible() and self.width() > 240 and self.height() > 160)
+        if bloom:
+            back = self._grab(old)          # before anything is hidden
         self._pair = None
         self._active = view
         W, H = float(self.width()), float(self.height())
@@ -2085,8 +1977,9 @@ class ViewHost(QWidget):
                               anchors={other: "r" if left_gone else "l", view: "l" if left_gone else "r"}, leaving={other})
                 return
         self._snap({view: full})
-        if shot is not False:
-            self._drop.play(shot, QPointF(float(origin.x()), 0.0), T.c("acc"), T.c("window"), T.dark)
+        if bloom:
+            self._bloom.play(back, self._shots.get(view), origin)
+        return bloom
 
     def show_split(self, left, right, active, animate=True):
         """Show two pages side by side. The one that was alone before grows to make room for the other."""
@@ -2138,7 +2031,7 @@ class ViewHost(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self._drop.cancel()
+        self._bloom.stop()
         if self._pair:
             self._snap(self._split_rects())
         elif self._active is not None:
@@ -2710,14 +2603,6 @@ class PushButton(QAbstractButton):
         self._g_pr = Glide(self, self._sp, 30)
         self.pressed.connect(lambda: self._g_pr.to(1.0))
         self.released.connect(lambda: self._g_pr.to(0.0))
-        self._rip = Ripples(self)
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self.isEnabled():
-            play_sound("click")
-            if fx_on():
-                self._rip.add(e.position().x(), e.position().y())
-        super().mousePressEvent(e)
 
     def _sh(self, v):
         self._hv = v
@@ -2756,26 +2641,17 @@ class PushButton(QAbstractButton):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(bg)
         p.drawRoundedRect(r, 11, 11)
-        if self._rip.items:
-            self._rip.paint(p, r, 11, QColor("#ffffff") if k in ("pri", "dng") else T.c("text"), r.width() * 0.8)
         p.setFont(ui_font(10, QFont.Weight.Medium))
         p.setPen(fg)
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
 
 
 class Badge(QWidget):
-    """The round icon at the top of a card. It pops in, and it can play out an answer the way Face ID does: on success the
-    padlock springs open, a ring draws itself around the badge, the lock turns into a check mark that is drawn stroke by
-    stroke, and a pulse spreads outward. On a refusal the lock rattles and flushes red."""
-
     def __init__(self, icon, tone):
         super().__init__()
         self.icon, self.tone, self._s = icon, tone, 0.6
         self.setFixedSize(60, 60)
         self._g = Glide(self, self._set, 11, 0.6, bounce=0.3)      # a touch of overshoot: it pops, then settles
-        self.verdict, self._vt = None, 0.0                           # None, "ok" or "bad", and seconds since it began
-        self.on_change = None                                        # the card repaints its pulse when this fires
-        self._vrun = self._vstep
 
     def _set(self, v):
         self._s = v
@@ -2783,54 +2659,6 @@ class Badge(QWidget):
 
     def pop(self):
         self._g.to(1.0)
-
-    def verify(self, ok):
-        if not fx_on():
-            return
-        self.verdict, self._vt = ("ok" if ok else "bad"), 0.0
-        FrameClock.get().add(self._vrun)
-
-    def _vstep(self, dt):
-        self._vt += dt
-        self.update()
-        if self.on_change:
-            self.on_change()
-        if self.verdict == "bad" and self._vt > 1.0:
-            self.verdict = None
-            self.update()
-            return False
-        return self.verdict == "ok" and self._vt < 1.3 or self.verdict == "bad"
-
-    def rings(self):
-        """(radius, opacity) of the pulses leaving the badge, measured from its centre. The card paints them."""
-        if self.verdict != "ok":
-            return []
-        out = []
-        for delay in (0.22, 0.38):
-            u = (self._vt - delay) / 0.75
-            if 0.0 < u < 1.0:
-                out.append((30.0 + 54.0 * ease_out(u), 0.55 * (1.0 - u) ** 1.5))
-        return out
-
-    @staticmethod
-    def _lock(p, col, opened, alpha):
-        """The padlock, drawn by hand so its shackle can lift. Same shape as the 'lock' icon, on the same 24 unit grid."""
-        p.save()
-        p.setOpacity(p.opacity() * alpha)
-        k = 28.0 / 24.0
-        p.translate(16.0, 16.0)
-        p.scale(k, k)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(col, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        p.drawRoundedRect(QRectF(5.5, 10.8, 13.0, 9.4), 2.4, 2.4)
-        lift = 1.9 * opened
-        path = QPainterPath()
-        path.moveTo(8.5, 10.8)
-        path.lineTo(8.5, 8.2 - lift)
-        path.arcTo(QRectF(8.5, 4.7 - lift, 7.0, 7.0), 180.0, -180.0)
-        path.lineTo(15.5, 10.8 - 3.5 * opened)
-        p.drawPath(path)
-        p.restore()
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -2841,69 +2669,6 @@ class Badge(QWidget):
         p.scale(s, s)
         p.translate(-c)
         col = T.c(self.tone)
-        t = self._vt
-        if self.verdict == "ok":
-            col = T.mix(self.tone, "ok", ease_out(t / 0.35))
-            ok = T.c("ok")
-            bump = 1.0 + 0.07 * math.sin(math.pi * clamp01((t - 0.55) / 0.45))
-            p.translate(c)
-            p.scale(bump, bump)
-            p.translate(-c)
-            fill = QColor(col)
-            fill.setAlphaF(0.17 + 0.07 * ease_out(t / 0.5))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(fill)
-            p.drawEllipse(QRectF(2, 2, 56, 56))
-            # 1. the padlock springs open, then dissolves
-            fade = 1.0 - ease_in_out((t - 0.34) / 0.26)
-            if fade > 0.01:
-                p.save()
-                sc = 1.0 - 0.22 * (1.0 - fade)
-                p.translate(c)
-                p.scale(sc, sc)
-                p.translate(-c)
-                self._lock(p, col, ease_out(t / 0.26), fade)
-                p.restore()
-            # 2. a ring draws itself around the badge
-            prog = ease_in_out((t - 0.12) / 0.5)
-            if prog > 0.0:
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(ok, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                p.drawArc(QRectF(3.5, 3.5, 53, 53), 90 * 16, -int(prog * 360 * 16))
-            # 3. the check mark is drawn stroke by stroke
-            cp = ease_out((t - 0.40) / 0.38)
-            if cp > 0.0:
-                k = 28.0 / 24.0
-                pts = [QPointF(16 + x * k, 16 + y * k) for x, y in ((5.5, 12.5), (9.8, 16.8), (18.5, 7.8))]
-                l1, l2 = math.hypot(4.3, 4.3), math.hypot(8.7, 9.0)
-                run = cp * (l1 + l2)
-                path = QPainterPath(pts[0])
-                if run <= l1:
-                    f = run / l1
-                    path.lineTo(pts[0] + (pts[1] - pts[0]) * f)
-                else:
-                    path.lineTo(pts[1])
-                    f = (run - l1) / l2
-                    path.lineTo(pts[1] + (pts[2] - pts[1]) * f)
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                p.setPen(QPen(ok, 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-                p.drawPath(path)
-            return
-        if self.verdict == "bad":
-            flush = ease_out(t / 0.12) * (1.0 - smoothstep((t - 0.45) / 0.45))
-            col = T.mix(self.tone, "bad", flush)
-            p.setPen(Qt.PenStyle.NoPen)
-            fill = QColor(col)
-            fill.setAlphaF(0.17 + 0.08 * flush)
-            p.setBrush(fill)
-            p.drawEllipse(QRectF(2, 2, 56, 56))
-            p.save()
-            p.translate(c)
-            p.rotate(shake_offset(t, 1.0, 9.0, 5.0) * 11.0)         # the padlock rattles
-            p.translate(-c)
-            draw_icon(p, self.icon, QRectF(16, 16, 28, 28), col)
-            p.restore()
-            return
         p.setPen(Qt.PenStyle.NoPen)
         fill = QColor(col)
         fill.setAlphaF(.17)
@@ -2915,13 +2680,9 @@ class Badge(QWidget):
 class Sheet(QWidget):
     done = pyqtSignal(object)
 
-    def __init__(self, root, icon="info", tone="acc", title="", body="", rows=(), buttons=(), cancel=None, field=None, hold=()):
-        """hold: button values that do NOT close the card. The card waits for resolve(): True plays the Face ID style success,
-        False shakes it and keeps it open for another try, None just closes it."""
+    def __init__(self, root, icon="info", tone="acc", title="", body="", rows=(), buttons=(), cancel=None, field=None):
         super().__init__(root)
         self._cancel, self._first = cancel, (buttons[0][2] if buttons else None)
-        self._hold, self._pending, self._shk, self._shx, self._body = set(hold), False, None, 0.0, None
-        self._shk_run = self._shk_step
         self.edit = None
         self._a = 0.0
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -2932,7 +2693,6 @@ class Sheet(QWidget):
         lay.setContentsMargins(26, 28, 26, 22)
         lay.setSpacing(0)
         self.badge = Badge(icon, tone)
-        self.badge.on_change = self.update
         lay.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addSpacing(14)
         t = QLabel(title)
@@ -2948,7 +2708,6 @@ class Sheet(QWidget):
             b.setAlignment(Qt.AlignmentFlag.AlignCenter)
             b.setTextFormat(Qt.TextFormat.PlainText)
             b.setStyleSheet(f"color:{T.c('mut').name()};font-size:13px;background:transparent")
-            self._body = b
             lay.addWidget(b)
         if rows:
             lay.addSpacing(14)
@@ -3007,7 +2766,7 @@ class Sheet(QWidget):
     def _layout_card(self):
         self.card.adjustSize()
         self._base_y = (self.height() - self.card.height()) // 2
-        self.card.move((self.width() - self.card.width()) // 2 + iround(self._shx), self._base_y + iround((1 - self._a) * 26))
+        self.card.move((self.width() - self.card.width()) // 2, self._base_y + iround((1 - self._a) * 26))
 
     def resizeEvent(self, e):
         self._layout_card()
@@ -3031,7 +2790,6 @@ class Sheet(QWidget):
         self._layout_card()
         self.show()
         self.raise_()
-        play_sound("sheet")
         if self.edit is not None:
             QTimer.singleShot(60, self.edit.setFocus)
         else:
@@ -3040,59 +2798,12 @@ class Sheet(QWidget):
         FrameClock.get().after(0.09, self.badge.pop)
 
     def finish(self, value):
-        if self._closing or self._pending:
-            return
-        key = value[0] if isinstance(value, tuple) else value
-        if key in self._hold:
-            self._pending = True          # stays open: whoever asked decides how it ends (resolve)
-            self.done.emit(value)
-            return
-        self._begin_close()
-        self.done.emit(value)
-
-    def _begin_close(self):
         if self._closing:
             return
         self._closing = True
         self._g.rate = 20
         self._g.to(0.0)
-
-    def resolve(self, result, message=""):
-        """Answer a held card. True: success (the padlock opens, a ring and a check draw, a pulse spreads), then it closes.
-        False: it shakes and shows `message`, ready for another try. None: it simply closes."""
-        if self._closing:
-            return
-        if result is None:
-            self._pending = False
-            self._begin_close()
-        elif result:
-            self.badge.verify(True)
-            play_sound("unlock")
-            self._pending = True          # ignore input while the celebration plays
-            FrameClock.get().after(1.0 if fx_on() else 0.0, self._begin_close)
-        else:
-            self._pending = False
-            self.badge.verify(False)
-            play_sound("error")
-            if fx_on():
-                self._shk = 0.0
-                FrameClock.get().add(self._shk_run)
-            if self._body is not None and message:
-                self._body.setText(message)
-                self._body.setStyleSheet(f"color:{T.c('bad').name()};font-size:13px;background:transparent")
-            if self.edit is not None:
-                self.edit.clear()
-                self.edit.setFocus()
-
-    def _shk_step(self, dt):
-        self._shk += dt
-        done = self._shk > 0.7
-        self._shx = 0.0 if done else shake_offset(self._shk, 14.0, 7.5, 6.0)
-        self._layout_card()
-        self.update()
-        if done:
-            self._shk = None
-        return not done
+        self.done.emit(value)
 
     def event(self, e):
         if e.type() == QEvent.Type.ShortcutOverride and e.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -3121,15 +2832,6 @@ class Sheet(QWidget):
         p.setPen(QPen(T.c("line"), 1))
         p.setBrush(T.c("card"))
         p.drawRoundedRect(r, 22, 22)
-        pulses = self.badge.rings()
-        if pulses:
-            c = QPointF(self.badge.mapTo(self, self.badge.rect().center()))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            for rad, a in pulses:
-                col = T.c("ok")
-                col.setAlphaF(a)
-                p.setPen(QPen(col, 2.2))
-                p.drawEllipse(c, rad, rad)
 
 
 # --------------------------------------------------------------------------

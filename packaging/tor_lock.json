@@ -1,0 +1,63 @@
+{
+  "version": "15.0.24",
+  "generated": "2026-10-08",
+  "signing_key": "EF6E286DDA85EA2A4BA7DE684E2C6E8793298290",
+  "platforms": {
+    "windows-x86_64": {
+      "file": "tor-expert-bundle-windows-x86_64-15.0.24.tar.gz",
+      "sha256": "e9dc6ccc93cd6afa507193f4de284d6424233ff5102155cd2c94b259e8a22b65",
+      "exe_sha256": "90bbdcafd586feea608a5e9b7d3959f4ee194f7770755cfde8fab240e9773ad1",
+      "size": 22440870,
+      "transports": [
+        "obfs4",
+        "snowflake"
+      ],
+      "urls": [
+        "https://dist.torproject.org/torbrowser/15.0.24/tor-expert-bundle-windows-x86_64-15.0.24.tar.gz",
+        "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-windows-x86_64-15.0.24.tar.gz"
+      ]
+    },
+    "macos-aarch64": {
+      "file": "tor-expert-bundle-macos-aarch64-15.0.24.tar.gz",
+      "sha256": "d47afd04b6c751129978390ad003d74ac8b88adfbb939350f0f89999e6570644",
+      "exe_sha256": "85843ba0bfc876411d2b237f923a8e6a230870c60c1af23fd68206df8abc2ad7",
+      "size": 18724201,
+      "transports": [
+        "obfs4",
+        "snowflake"
+      ],
+      "urls": [
+        "https://dist.torproject.org/torbrowser/15.0.24/tor-expert-bundle-macos-aarch64-15.0.24.tar.gz",
+        "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-macos-aarch64-15.0.24.tar.gz"
+      ]
+    },
+    "macos-x86_64": {
+      "file": "tor-expert-bundle-macos-x86_64-15.0.24.tar.gz",
+      "sha256": "8acb0b590f6be34084dcb6d84009ac0c61cc7c5261b7a19d2ab94845aa9bd5b6",
+      "exe_sha256": "936be37bed7175f1c011543f318e996a9bfe624b8d0ac9968c4304e2751cb2f3",
+      "size": 19356806,
+      "transports": [
+        "obfs4",
+        "snowflake"
+      ],
+      "urls": [
+        "https://dist.torproject.org/torbrowser/15.0.24/tor-expert-bundle-macos-x86_64-15.0.24.tar.gz",
+        "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-macos-x86_64-15.0.24.tar.gz"
+      ]
+    },
+    "linux-x86_64": {
+      "file": "tor-expert-bundle-linux-x86_64-15.0.24.tar.gz",
+      "sha256": "8e012ec6815d7899cb64011582e2dade88e74119c6661068a2a3252de0ccd7f2",
+      "exe_sha256": "74f5a47bfe0fc7f7c3ec2fe6c772ec6e52d4a9e9e9c95c7f274f5330e02a8813",
+      "size": 32348376,
+      "transports": [
+        "obfs4",
+        "snowflake"
+      ],
+      "urls": [
+        "https://dist.torproject.org/torbrowser/15.0.24/tor-expert-bundle-linux-x86_64-15.0.24.tar.gz",
+        "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-linux-x86_64-15.0.24.tar.gz"
+      ]
+    }
+  }
+}

@@ -64,6 +64,9 @@ DEFAULTS = {
     "scan_defender": True,
     "vt_auto_lookup": False,
     "history_days": 30,
+    "sound_effects": False,           # interface sounds the person supplies (shield_sound.py)
+    "sound_scroll": True,             # ...and a scroll sound, once sound effects are on
+    "sound_volume": 60,
     "persistent_sessions": False,
     "site_rules": {},
     "custom_blocklist": [],
@@ -90,11 +93,6 @@ DEFAULTS = {
     # what to do if the network blocks Tor, and the person's own bridge lines (validated again whenever they are used)
     "proxy_bridge_mode": "auto",
     "proxy_bridges": "",
-    # feel (shield_fx.py, shield_sound.py)
-    "fluid_motion": True,             # the water-drop tab reveal, ripples, the light around the address bar, smooth scrolling
-    "sound_effects": True,            # master switch for every sound (silent until audio files are put in the sounds folder)
-    "sound_volume": 65,               # percent
-    "scroll_sound": True,             # the scroll tick or bed, on top of the master switch
 }
 CHOICES = {
     "theme": {"dark", "light", "system"},
@@ -105,8 +103,8 @@ CHOICES = {
     "fingerprint_level": {"standard", "strict"},
     "startup": {"home", "restore"},
     "vault_autolock": {0, 5, 15, 60},
-    "sound_volume": {30, 65, 100},
     "proxy_bridge_mode": {"auto", "off", "obfs4", "snowflake", "custom"},
+    "sound_volume": {30, 60, 100},
 }
 RULES = {"nojs", "http", "noblock"}
 

@@ -71,6 +71,8 @@ main{flex:1;min-width:0;max-width:840px;margin:0 auto;padding:46px 44px 140px}
 @keyframes softin{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 @keyframes pop{0%{opacity:0;transform:scale(.6)}60%{opacity:1;transform:scale(1.08)}100%{transform:scale(1)}}
+@keyframes draw{from{stroke-dashoffset:90}to{stroke-dashoffset:0}}
+@keyframes ring{0%{transform:scale(.55);opacity:.7}100%{transform:scale(2.2);opacity:0}}
 @keyframes rot{to{transform:rotate(360deg)}}
 @keyframes slide{0%{transform:translateX(-110%)}100%{transform:translateX(310%)}}
 main>*{animation:rise .6s var(--ease) both}
@@ -136,7 +138,7 @@ textarea.inp{width:100%;min-height:100px;font:12.5px/1.6 ui-monospace,Menlo,Cons
 .bar.ind i{width:34%;animation:slide 1.3s var(--ease) infinite}
 .verdict{--tone:var(--mut);display:flex;gap:14px;align-items:flex-start;margin:0 12px 12px;padding:14px 16px;border-radius:12px;background:color-mix(in srgb,var(--tone) 10%,transparent);animation:fade .5s var(--ease)}
 .verdict .bd{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;color:var(--tone);background:color-mix(in srgb,var(--tone) 18%,transparent);flex:none}
-.verdict .bd .ic{animation:pop .55s var(--spring) both}
+.verdict .bd .ic{animation:pop .55s var(--spring) both,draw .8s var(--ease) both}
 .verdict h4{margin:0;font-size:14.5px;font-weight:620;letter-spacing:-.01em;color:var(--tone)}.verdict p{margin:2px 0 0;color:var(--text);opacity:.82;font-size:13px;line-height:1.5}
 .tone-ok{--tone:var(--ok)}.tone-warn{--tone:var(--warn)}.tone-bad{--tone:var(--bad)}.tone-info{--tone:var(--acc-t)}
 .ring{width:18px;height:18px;border-radius:50%;border:2.2px solid color-mix(in srgb,var(--acc) 22%,transparent);border-top-color:var(--acc);animation:rot .75s linear infinite}
@@ -196,11 +198,16 @@ box-shadow:0 0 0 1px var(--line),0 6px 22px rgba(0,0,0,.14);transition:box-shado
 .foot{position:fixed;left:0;right:0;bottom:22px;text-align:center;color:var(--faint);font-size:12.5px}.foot a{color:var(--mut)}
 .warnbox{max-width:480px;text-align:center;display:flex;flex-direction:column;align-items:center}
 .warnbox .bd{width:68px;height:68px;border-radius:50%;display:grid;place-items:center;color:var(--bad);background:color-mix(in srgb,var(--bad) 15%,transparent);margin-bottom:22px}
-.warnbox .bd .ic{animation:pop .7s var(--spring) .15s both}
+.warnbox .bd .ic{animation:pop .7s var(--spring) .15s both,draw .9s var(--ease) .15s both}
 .warnbox h1{font-size:28px}.warnbox p{color:var(--mut);line-height:1.55;margin:0 0 14px}.warnbox p b{color:var(--text);font-weight:600}
 .warnbox .mono{background:var(--surface);padding:9px 14px;border-radius:10px;max-width:100%;margin-bottom:26px;box-shadow:0 0 0 1px var(--line)}
 @media(max-width:760px){nav{display:none}main{padding:28px 18px 120px}}
 @media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+"""
+CSS += """.verdict .bd,.sheet .bd,.warnbox .bd{position:relative}
+.sheet .bd .ic,.verdict .bd .ic,.warnbox .bd .ic{stroke-dasharray:90}
+.sheet-bg.on .bd .ic{animation:draw .75s var(--ease) .12s both}
+.verdict .bd::after,.warnbox .bd::after,.sheet-bg.on .bd::after{content:"";position:absolute;inset:0;border-radius:50%;border:2px solid currentColor;opacity:0;animation:ring 1.1s var(--ease) .1s forwards;pointer-events:none}
 """
 CSS += "".join(f"main>*:nth-child({i}){{animation-delay:{(i - 1) * 32}ms}}" for i in range(2, 16))
 # Arriving from another internal page: a short fade, no staggered intro, so switching sections feels instant.
@@ -396,17 +403,13 @@ def page_settings(ctx, q):
                  "Off means cookies and site data are wiped on exit, which is the most private. Needs a restart.")
         + toggle(c, "clear_on_exit", "Clear cookies and cache when Shield closes",
                  "Only matters if you stay signed in between sessions. Sites will ask you to sign in again.")
+        + toggle(c, "sound_effects", "Sound effects",
+                 f"Plays sounds you choose for clicks and for tabs opening. Put click.wav, open.wav and scroll.wav in "
+                 f"<span class=\"mono\">{esc(str(HOME / 'sounds'))}</span> (.wav plays fastest; .mp3 and .ogg work too). Nothing is built in.")
+        + toggle(c, "sound_scroll", "Scroll sound", "Plays your scroll sound in small ticks while you scroll a page. Needs sound effects on.")
+        + segmented(c, "sound_volume", "Sound volume", "How loud the interface sounds are.", [(30, "Soft"), (60, "Medium"), (100, "Loud")])
         + toggle(c, "hardened_mode", "Hardened mode (no JIT)",
                  "Runs JavaScript without the JIT compiler, which most browser exploits rely on. Heavy pages, games and web apps run slower, and WebAssembly stops working. Needs a restart.")
-    )
-    feel = (
-        toggle(c, "fluid_motion", "Fluid motion", "Tabs fall open like a drop of water, buttons ripple, the address bar glows when you click it, "
-               "and pages scroll smoothly. Turn it off for a calmer browser. Windows' own 'animation effects' setting is respected too.")
-        + toggle(c, "sound_effects", "Sound effects", "Soft sounds for clicks, tabs and unlocking. Sounds come from the files in Shield's sounds folder; "
-                 "with no files there, Shield stays silent.")
-        + segmented(c, "sound_volume", "Sound volume", "How loud the sound effects are, relative to your computer's volume.",
-                    [(30, "Low"), (65, "Medium"), (100, "High")])
-        + toggle(c, "scroll_sound", "Scroll sound", "A sound that follows your scrolling. Needs sound effects to be on.")
     )
     app0 = ctx.app
     summ = app0.protection_summary() if app0 else {"network": 0, "cosmetic": 0, "threats": 0, "ready": False}
@@ -510,7 +513,6 @@ def page_settings(ctx, q):
     body = f"""
 <h1>Settings</h1><p class="lede">Everything stays on this computer. Shield has no accounts, sync, telemetry or crash reporting.</p>
 <h2>General</h2><div class="group">{general}</div>
-<h2>Motion and sound</h2><div class="group">{feel}</div>
 <h2>Privacy and security</h2><div class="group">{privacy}</div>
 <h2>Private connection</h2><div class="group">{proxy}</div>
 <h2 id="lists">Protection lists</h2><div class="group">{lists}</div>

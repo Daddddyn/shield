@@ -62,6 +62,12 @@ if (-not (Test-Path "packaging\shield.ico")) {
     if ($LASTEXITCODE -ne 0) { Fail "Couldn't create the icon" }
 }
 
+# ---- Tor for this system --------------------------------------------------------------------------------------
+# Each installer carries only its own system's Tor (tor\tor_win here). get_tor.py fetches it, checked against packaging\tor_lock.json.
+Step "Tor (the private connection's program)"
+& $py packaging\get_tor.py
+if ($LASTEXITCODE -ne 0) { Fail "Couldn't get Tor. If packaging\tor_lock.json doesn't exist yet, run once:  python packaging\get_tor.py --update" }
+
 # ---- program folder -----------------------------------------------------------------------------------------
 Step "Packing the program (PyInstaller)"
 Remove-Item -Recurse -Force dist, build -ErrorAction SilentlyContinue
